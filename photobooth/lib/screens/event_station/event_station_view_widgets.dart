@@ -5,9 +5,14 @@ import '../../utils/app_strings.dart';
 import '../../views/widgets/cached_network_image.dart';
 
 class EventStationStatsBar extends StatelessWidget {
-  const EventStationStatsBar({super.key, required this.stats});
+  const EventStationStatsBar({
+    super.key,
+    required this.stats,
+    this.delivery = const EventDeliveryStats(),
+  });
 
   final EventStationStats stats;
+  final EventDeliveryStats delivery;
 
   @override
   Widget build(BuildContext context) {
@@ -31,6 +36,23 @@ class EventStationStatsBar extends StatelessWidget {
                   label: AppStrings.eventStationStatsPrint,
                   value:
                       '${stats.printPending} / ${stats.printClaimed} / ${stats.printDone}',
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                _StatCell(
+                  label: AppStrings.eventStationStatsGuests,
+                  value: '${delivery.guestsRegistered}',
+                ),
+                _StatCell(
+                  label: AppStrings.eventStationStatsProcessed,
+                  value: '${delivery.processed}',
+                ),
+                _StatCell(
+                  label: AppStrings.eventStationStatsDigital,
+                  value: '${delivery.digitalSent}',
                 ),
               ],
             ),
@@ -77,6 +99,8 @@ class EventStationStatusTabs extends StatelessWidget {
     this.pendingCount,
     this.claimedCount,
     this.doneCount,
+    this.allCount,
+    this.includeAll = false,
   });
 
   final String selected;
@@ -84,11 +108,18 @@ class EventStationStatusTabs extends StatelessWidget {
   final int? pendingCount;
   final int? claimedCount;
   final int? doneCount;
+  final int? allCount;
+  final bool includeAll;
 
   @override
   Widget build(BuildContext context) {
     return SegmentedButton<String>(
       segments: [
+        if (includeAll)
+          ButtonSegment(
+            value: 'ALL',
+            label: Text(_tab(AppStrings.eventStationStatusAll, allCount)),
+          ),
         ButtonSegment(
           value: 'PENDING',
           label: Text(_tab(AppStrings.eventStationStatusPending, pendingCount)),
@@ -132,10 +163,7 @@ class _EventStationImageCarouselState extends State<EventStationImageCarousel> {
   @override
   Widget build(BuildContext context) {
     if (widget.urls.isEmpty) {
-      return const SizedBox(
-        height: 180,
-        child: Center(child: Text(AppStrings.eventStationEmptyCaptures)),
-      );
+      return const SizedBox.shrink();
     }
     return Column(
       children: [

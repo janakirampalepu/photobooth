@@ -1,7 +1,10 @@
 import '../../models/strip_models.dart';
 import '../../services/direct_ptp_camera_service.dart';
+import '../../utils/app_runtime_config.dart';
 import '../../utils/app_strings.dart';
 import '../../utils/capture_session_kind.dart';
+import '../../utils/classic_pose_countdown.dart';
+import '../../utils/classic_pose_mode_helpers.dart';
 import '../../utils/constants.dart';
 
 /// How many stills the native screen should collect for [kind].
@@ -13,7 +16,9 @@ int directPtpShotCountFor(CaptureSessionKind kind) =>
 /// Read from [AppConstants] and passed to the native screen rather than
 /// duplicated in Kotlin, so booth timing stays defined in one place.
 int directPtpCountdownSecondsFor(CaptureSessionKind kind) => kind.isClassic
-    ? AppConstants.kFlashbackCaptureCountdownSeconds
+    ? normalizeClassicPoseCountdownSeconds(
+        AppRuntimeConfig.instance.classicPoseCountdownSeconds,
+      )
     : AppConstants.kCaptureCountdownSeconds;
 
 /// Seconds between strip shots for guests to rearrange.
@@ -23,21 +28,21 @@ int get directPtpBetweenShotSeconds =>
 /// How long the native screen holds a just-taken still before moving on.
 ///
 /// **0 means wait indefinitely for a tap**, and that is the case for every flow
-/// except the Classic 4-shot strip.
+/// except the Classic 2×6 strip (3- or 4-shot).
 ///
 /// The rule comes from [shouldScheduleFlashbackAutoAccept], which only schedules
 /// auto-accept when `isFlashbackMultiShot` — and that is
-/// `sessionKind.isClassicFourShot`, four-shot **only**, not "any Classic". So a
-/// FotoZen guest *and* a Classic 1-shot guest both review for as long as they
+/// `sessionKind.isClassicMultiShot`, strip sessions **only**, not "any Classic". So
+/// a FotoZen guest *and* a Classic 1-shot guest both review for as long as they
 /// like and press Continue / Pick a look or Retake.
 ///
 /// `flashbackShotReviewHoldDuration`'s `total <= 1` branch (600ms) looks like it
 /// contradicts this, but it is unreachable: its only caller runs after the
-/// auto-accept check, by which point `total` is the 4-shot cap. Mapping Classic
+/// auto-accept check, by which point `total` is the strip cap. Mapping Classic
 /// 1-shot onto it made the native screen blink past the review in ~600ms with no
 /// chance to retake — caught on hardware 2026-08-20.
 int directPtpReviewHoldMsFor(CaptureSessionKind kind) {
-  if (!kind.isClassicFourShot) return 0;
+  if (!kind.isClassicMultiShot) return 0;
   return AppConstants.kFlashbackBetweenShotRearrangeDuration.inMilliseconds;
 }
 
@@ -54,9 +59,9 @@ int directPtpReviewHoldMsFor(CaptureSessionKind kind) {
 /// A product decision, not a parity gap: if the two screens are ever compared
 /// side by side this is the difference that will show up, and it is intended.
 ///
-/// Everything that is not a 4-shot strip keeps 0 — see [directPtpReviewHoldMsFor].
+/// Everything that is not a 2×6 strip keeps 0 — see [directPtpReviewHoldMsFor].
 int directPtpFinalReviewHoldMsFor(CaptureSessionKind kind) {
-  if (!kind.isClassicFourShot) return 0;
+  if (!kind.isClassicMultiShot) return 0;
   return AppConstants.kFlashbackBetweenShotRearrangeDuration.inMilliseconds;
 }
 
@@ -122,12 +127,11 @@ bool directPtpResultIsUsable(
 ///
 /// Sourced from [AppStrings] so the native screen shows the same words as the
 /// Flutter one — switching between them should be invisible to a guest.
-String directPtpSubtitleFor(CaptureSessionKind kind) => switch (kind) {
-      CaptureSessionKind.classicFourShot => AppStrings.flashbackCaptureSubtitle,
-      CaptureSessionKind.classicOneShot =>
-        AppStrings.flashbackCaptureSubtitleSingle,
-      CaptureSessionKind.fotoZen => AppStrings.poseSubtitleDefault,
-    };
+String directPtpSubtitleFor(CaptureSessionKind kind) {
+  final mode = kind.classicShotMode;
+  if (mode != null) return classicPoseSubtitle(mode);
+  return AppStrings.poseSubtitleDefault;
+}
 
 /// Sanity bound on the strip length the native side is asked for.
 ///

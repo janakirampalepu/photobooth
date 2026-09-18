@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart' show kIsWeb, visibleForTesting;
 
 import '../screens/photo_capture/photo_model.dart';
 import '../services/api_service.dart';
+import '../services/local_guest_media_write.dart';
 import '../services/session_manager.dart';
 import 'app_strings.dart';
 import 'exceptions.dart';
@@ -83,8 +84,13 @@ Future<SessionPhotoSyncOutcome> ensureSessionPhotoOnServer({
       });
 
   try {
+    if (sm.isUserImageSyncedOnServer && sm.sessionId == sid) {
+      return const SessionPhotoSyncOutcome(alreadyPresent: true);
+    }
+
     final existing = await fetchSession(sid);
     if (sessionResponseHasUserImage(existing)) {
+      sm.markUserImageSynced();
       return const SessionPhotoSyncOutcome(alreadyPresent: true);
     }
 
@@ -93,6 +99,8 @@ Future<SessionPhotoSyncOutcome> ensureSessionPhotoOnServer({
     var imageFile = photo.imageFile;
     if (kIsWeb || forceWebMaterializeForSessionPhotoSyncTest) {
       imageFile = await _materializeWebXFile(imageFile);
+    } else {
+      imageFile = await persistCapturedGuestXFile(imageFile);
     }
 
     final dataUrl = await encodeForUpload(imageFile);
@@ -107,6 +115,7 @@ Future<SessionPhotoSyncOutcome> ensureSessionPhotoOnServer({
     }
 
     WebFlowTrace.log('SESSION_PHOTO', 'sync_upload_done');
+    sm.markUserImageSynced();
     return const SessionPhotoSyncOutcome(uploaded: true);
   } on ApiException catch (e) {
     return SessionPhotoSyncOutcome(errorMessage: e.message);

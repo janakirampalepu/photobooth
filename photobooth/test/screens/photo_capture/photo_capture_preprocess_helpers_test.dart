@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:photobooth/models/preprocess_image_result.dart';
 import 'package:photobooth/screens/photo_capture/photo_capture_preprocess_helpers.dart';
@@ -5,6 +7,7 @@ import 'package:photobooth/services/api_service.dart';
 import 'package:photobooth/services/session_manager.dart';
 import '../../fakes/fake_api_service.dart';
 import 'package:photobooth/utils/print_orientation.dart';
+import 'package:photobooth/services/local_session_skeleton.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 // ignore_for_file: avoid_redundant_argument_values
@@ -15,6 +18,7 @@ void main() {
   setUp(() {
     SharedPreferences.setMockInitialValues({});
     SessionManager().clearSession();
+    SessionPreprocessCoordinator.instance.reset();
   });
   group('resolvePersonCountAfterPreprocess', () {
     test('prefers preprocess personCount', () {
@@ -114,6 +118,26 @@ void main() {
   });
 
   group('ensureAuthoritativePersonCount', () {
+    test('skips Fly preprocess when the session is offline', () async {
+      final sm = SessionManager();
+      sm.setSessionFromResponse({
+        ..._sessionJson('sess-off'),
+        kKioskSessionOfflineKey: true,
+      });
+      var preprocessCalls = 0;
+      await ensureAuthoritativePersonCount(
+        sessionManager: sm,
+        apiService: ApiService(),
+        sessionId: 'sess-off',
+        preprocessFn: (_) async {
+          preprocessCalls++;
+          return const PreprocessImageResult(success: true, personCount: 9);
+        },
+      );
+      expect(preprocessCalls, 0);
+      expect(sm.personCount, isNull);
+    });
+
     test('skips preprocess when session already has a group count', () async {
       final sm = SessionManager();
       sm.setSessionFromResponse({
@@ -175,6 +199,163 @@ void main() {
         sessionId: 'sess-api-pre',
       );
       expect(sm.personCount, 2);
+    });
+
+    test('skips a second preprocess after the first completed', () async {
+      final sm = SessionManager();
+      sm.setSessionFromResponse(_sessionJson('sess-once'));
+      var calls = 0;
+      Future<PreprocessImageResult> run(_) async {
+        calls++;
+        return const PreprocessImageResult(success: true, personCount: 1);
+      }
+
+      await ensureAuthoritativePersonCount(
+        sessionManager: sm,
+        apiService: ApiService(),
+        sessionId: 'sess-once',
+        preprocessFn: run,
+      );
+      await ensureAuthoritativePersonCount(
+        sessionManager: sm,
+        apiService: ApiService(),
+        sessionId: 'sess-once',
+        preprocessFn: run,
+      );
+      expect(calls, 1);
+      expect(sm.personCount, 1);
+    });
+
+    test('concurrent ensureAuthoritativePersonCount shares one POST', () async {
+      final sm = SessionManager();
+      sm.setSessionFromResponse(_sessionJson('sess-join'));
+      final gate = Completer<PreprocessImageResult>();
+      var calls = 0;
+      Future<PreprocessImageResult> run(_) {
+        calls++;
+        return gate.future;
+      }
+
+      final first = ensureAuthoritativePersonCount(
+        sessionManager: sm,
+        apiService: ApiService(),
+        sessionId: 'sess-join',
+        preprocessFn: run,
+      );
+      final second = ensureAuthoritativePersonCount(
+        sessionManager: sm,
+        apiService: ApiService(),
+        sessionId: 'sess-join',
+        preprocessFn: run,
+      );
+      gate.complete(const PreprocessImageResult(success: true, personCount: 2));
+      await Future.wait([first, second]);
+      expect(calls, 1);
+      expect(sm.personCount, 2);
+    });
+
+    test('ignores preprocess timeout', () async {
+      final sm = SessionManager();
+      sm.setSessionFromResponse(_sessionJson('sess-timeout'));
+      await ensureAuthoritativePersonCount(
+        sessionManager: sm,
+        apiService: ApiService(),
+        sessionId: 'sess-timeout',
+        preprocessFn: (_) async => throw TimeoutException('slow'),
+      );
+      expect(sm.personCount, isNull);
+      expect(
+        SessionPreprocessCoordinator.instance.isCompletedFor('sess-timeout'),
+        isFalse,
+      );
+    });
+
+    test('retries preprocess after a timeout so generate can still refine count',
+        () async {
+      final sm = SessionManager();
+      sm.setSessionFromResponse(_sessionJson('sess-retry'));
+      var calls = 0;
+      await ensureAuthoritativePersonCount(
+        sessionManager: sm,
+        apiService: ApiService(),
+        sessionId: 'sess-retry',
+        preprocessFn: (_) async {
+          calls++;
+          throw TimeoutException('slow');
+        },
+      );
+      await ensureAuthoritativePersonCount(
+        sessionManager: sm,
+        apiService: ApiService(),
+        sessionId: 'sess-retry',
+        preprocessFn: (_) async {
+          calls++;
+          return const PreprocessImageResult(success: true, personCount: 3);
+        },
+      );
+      expect(calls, 2);
+      expect(sm.personCount, 3);
+    });
+
+    test('runOrJoinSessionPreprocess joins inflight for the same session',
+        () async {
+      final gate = Completer<PreprocessImageResult>();
+      var calls = 0;
+      Future<PreprocessImageResult> run(_) {
+        calls++;
+        return gate.future;
+      }
+
+      final first = runOrJoinSessionPreprocess(
+        sessionId: 'sess-rj',
+        preprocessFn: run,
+      );
+      final second = runOrJoinSessionPreprocess(
+        sessionId: 'sess-rj',
+        preprocessFn: run,
+      );
+      expect(SessionPreprocessCoordinator.instance.inflightFor('other'), isNull);
+      gate.complete(const PreprocessImageResult(success: true, personCount: 3));
+      expect((await first).personCount, 3);
+      expect((await second).personCount, 3);
+      expect(calls, 1);
+      expect(
+        SessionPreprocessCoordinator.instance.isCompletedFor('sess-rj'),
+        isTrue,
+      );
+    });
+
+    test('older preprocess settle does not complete a newer session', () async {
+      final firstGate = Completer<PreprocessImageResult>();
+      final secondGate = Completer<PreprocessImageResult>();
+      final first = SessionPreprocessCoordinator.instance.track(
+        sessionId: 'sess-a',
+        future: firstGate.future,
+      );
+      final second = SessionPreprocessCoordinator.instance.track(
+        sessionId: 'sess-b',
+        future: secondGate.future,
+      );
+      firstGate.complete(
+        const PreprocessImageResult(success: true, personCount: 1),
+      );
+      await first;
+      expect(
+        SessionPreprocessCoordinator.instance.isCompletedFor('sess-b'),
+        isFalse,
+      );
+      expect(
+        SessionPreprocessCoordinator.instance.inflightFor('sess-b'),
+        isNotNull,
+      );
+      secondGate.complete(
+        const PreprocessImageResult(success: true, personCount: 2),
+      );
+      expect((await second).personCount, 2);
+      expect(
+        SessionPreprocessCoordinator.instance.isCompletedFor('sess-b'),
+        isTrue,
+      );
     });
   });
 

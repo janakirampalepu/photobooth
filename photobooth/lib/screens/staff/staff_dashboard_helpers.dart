@@ -1,3 +1,20 @@
+import '../../models/staff_dashboard_models.dart';
+
+/// One-shot lookup payload so the dashboard can paint without a second session GET.
+abstract final class StaffOpsSessionHold {
+  static StaffOpsSession? _next;
+
+  static void store(StaffOpsSession session) => _next = session;
+
+  static StaffOpsSession? take() {
+    final value = _next;
+    _next = null;
+    return value;
+  }
+
+  static void clearForTests() => _next = null;
+}
+
 /// Pure helpers for staff dashboard date labels and shift duration.
 abstract final class StaffDashboardHelpers {
   static const defaultTimezone = 'Asia/Kolkata';
@@ -17,6 +34,18 @@ abstract final class StaffDashboardHelpers {
   /// True when [isoDate] is `YYYY-MM-DD`.
   static bool isValidIsoDate(String isoDate) {
     return RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(isoDate.trim());
+  }
+
+  /// Parses `YYYY-MM-DD` into a local calendar [DateTime], or null.
+  static DateTime? tryParseIsoDate(String isoDate) {
+    final trimmed = isoDate.trim();
+    if (!isValidIsoDate(trimmed)) return null;
+    final parts = trimmed.split('-');
+    return DateTime(
+      int.parse(parts[0]),
+      int.parse(parts[1]),
+      int.parse(parts[2]),
+    );
   }
 
   static String formatDayLabel(String isoDate) {

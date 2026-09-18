@@ -1,15 +1,26 @@
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:provider/provider.dart';
 
 import '../../models/event_station_models.dart';
 import '../../services/event_manager.dart';
 import '../../utils/app_strings.dart';
 import '../../utils/constants.dart';
+import '../../utils/event_bulk_import.dart';
 import '../../views/widgets/app_scaffold.dart';
 import '../../views/widgets/app_snackbar.dart';
-import '../../views/widgets/cached_network_image.dart';
+import 'event_capture_station_view_widgets.dart';
 import 'event_capture_station_viewmodel.dart';
+import 'event_station_chrome_view_widgets.dart';
 import 'event_station_view_widgets.dart';
+
+Future<List<XFile>> pickEventCaptureImportImages() {
+  return ImagePicker().pickMultiImage(
+    maxWidth: AppConstants.kMaxImageWidth.toDouble(),
+    maxHeight: AppConstants.kMaxImageHeight.toDouble(),
+    imageQuality: AppConstants.kGalleryPickerImageQuality,
+  );
+}
 
 class EventCaptureStationScreen extends StatelessWidget {
   const EventCaptureStationScreen({super.key});
@@ -21,34 +32,56 @@ class EventCaptureStationScreen extends StatelessWidget {
         .pushReplacementNamed(AppConstants.kRouteEventStation);
   }
 
+  Future<void> _captureNext(
+    BuildContext context,
+    EventCaptureStationViewModel vm,
+  ) async {
+    final ok = await vm.startNextGuest();
+    if (!context.mounted) return;
+    if (!ok) {
+      AppSnackBar.showError(
+        context,
+        vm.errorMessage ?? AppConstants.kErrorUnknown,
+      );
+      return;
+    }
+    await Navigator.of(context).pushReplacementNamed(
+      AppConstants.kRouteCapture,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return ChangeNotifierProvider(
-      create: (_) => EventCaptureStationViewModel()..startPolling(),
+      create: (_) => EventCaptureStationViewModel(
+        importHooks: const EventCaptureImportHooks(
+          pickImages: pickEventCaptureImportImages,
+        ),
+      )..startPolling(),
       child: AppScaffold(
         title: AppStrings.eventStationCapture,
         showBackButton: true,
         onBackPressed: () => _changeRole(context),
         actions: [
-          TextButton(
+          EventStationChangeRoleButton(
             onPressed: () => _changeRole(context),
-            child: const Text(AppStrings.eventStationChangeRole),
           ),
         ],
-        child: Consumer<EventCaptureStationViewModel>(
+        child: EventStationBoundShell(
+          child: Consumer<EventCaptureStationViewModel>(
           builder: (context, vm, _) {
             return Padding(
               padding: const EdgeInsets.all(16),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  EventStationStatsBar(stats: vm.stats),
-                  const SizedBox(height: 12),
-                  EventStationImageCarousel(urls: vm.carouselUrls),
+                  EventStationStatsBar(stats: vm.stats, delivery: vm.delivery),
                   const SizedBox(height: 12),
                   EventStationStatusTabs(
                     selected: vm.statusFilter,
                     onSelected: vm.setStatusFilter,
+                    includeAll: true,
+                    allCount: vm.captures.length,
                     pendingCount: stationStatusCount(
                       vm.captures,
                       'PENDING',
@@ -66,37 +99,7 @@ class EventCaptureStationScreen extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 8),
-                  Expanded(
-                    child: vm.filteredCaptures.isEmpty
-                        ? const Center(
-                            child: Text(AppStrings.eventStationEmptyCaptures),
-                          )
-                        : ListView.separated(
-                            itemCount: vm.filteredCaptures.length,
-                            separatorBuilder: (_, __) =>
-                                const SizedBox(height: 8),
-                            itemBuilder: (context, i) {
-                              final item = vm.filteredCaptures[i];
-                              final thumb = item.previewUrls.isEmpty
-                                  ? null
-                                  : item.previewUrls.first;
-                              return ListTile(
-                                leading: thumb == null
-                                    ? null
-                                    : SizedBox(
-                                        width: 56,
-                                        height: 56,
-                                        child: CachedNetworkImage(
-                                          imageUrl: thumb,
-                                          fit: BoxFit.cover,
-                                        ),
-                                      ),
-                                title: Text(item.status),
-                                subtitle: Text(item.sessionId),
-                              );
-                            },
-                          ),
-                  ),
+                  Expanded(child: EventCaptureStationPane(viewModel: vm)),
                   if (vm.hasError)
                     Padding(
                       padding: const EdgeInsets.only(bottom: 8),
@@ -106,31 +109,15 @@ class EventCaptureStationScreen extends StatelessWidget {
                         style: const TextStyle(color: Colors.redAccent),
                       ),
                     ),
-                  ElevatedButton(
-                    onPressed: vm.isBusy
-                        ? null
-                        : () async {
-                            final ok = await vm.startNextGuest();
-                            if (!context.mounted) return;
-                            if (!ok) {
-                              AppSnackBar.showError(
-                                context,
-                                vm.errorMessage ?? AppConstants.kErrorUnknown,
-                              );
-                              return;
-                            }
-                            await Navigator.of(context).pushReplacementNamed(
-                              AppConstants.kRouteCapture,
-                            );
-                          },
-                    child: vm.isBusy
-                        ? const CircularProgressIndicator()
-                        : const Text(AppStrings.eventStationNextGuest),
+                  EventCaptureStationActions(
+                    viewModel: vm,
+                    onCaptureNext: () => _captureNext(context, vm),
                   ),
                 ],
               ),
             );
           },
+        ),
         ),
       ),
     );

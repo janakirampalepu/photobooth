@@ -2,7 +2,7 @@ import 'dart:convert';
 
 import 'package:camera/camera.dart';
 import 'package:dio/dio.dart';
-import 'package:flutter/foundation.dart' show kDebugMode, kIsWeb;
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:uuid/uuid.dart';
 
 import '../screens/result/transformed_image_model.dart';
@@ -15,10 +15,10 @@ import 'alice_inspector.dart';
 import 'api_client.dart';
 import 'api_dio_errors.dart';
 import 'api_image_url_utils.dart';
-import 'api_logging_interceptor.dart';
 import 'client_identification.dart';
 import 'dio_web_config_stub.dart' if (dart.library.html) 'dio_web_config.dart';
 import 'file_helper.dart';
+import 'local_guest_media_write.dart';
 
 /// Legacy media upload/download helpers (not used by the main kiosk SSE flow).
 class ApiServiceLegacyMedia {
@@ -78,10 +78,7 @@ class ApiServiceLegacyMedia {
         ...AppConfig.authorizationBearerHeader,
       }),
     ));
-    if (kDebugMode == true) {
-      dio.interceptors.add(ApiLoggingInterceptor());
-      dio.interceptors.add(AliceDioProxyInterceptor());
-    }
+    addHttpInspectorInterceptors(dio);
     configureDioForWeb(dio);
 
     final formData = FormData.fromMap({
@@ -178,6 +175,11 @@ class ApiServiceLegacyMedia {
   }) async {
     if (kIsWeb) {
       return XFile(imageUrl);
+    }
+
+    final local = await localXFileForGuestImage(imageUrl);
+    if (local != null) {
+      return local;
     }
 
     final resolvedUrl = withGeneratedImageSessionId(resolveApiImageUrl(imageUrl));

@@ -5,6 +5,7 @@ import 'package:photobooth/models/kiosk_info_model.dart';
 import 'package:photobooth/models/kiosk_share_link_model.dart';
 import 'package:photobooth/models/parallel_generation_result.dart';
 import 'package:photobooth/models/payment_initiate_result.dart';
+import 'package:photobooth/models/strip_models.dart';
 import 'package:photobooth/screens/result/transformed_image_model.dart';
 import 'package:photobooth/screens/theme_selection/theme_model.dart';
 
@@ -40,6 +41,37 @@ void main() {
     expect(m.thermalSafeMode, isTrue);
   });
 
+  test('AppSettingsModel.fromJson defaults show_api_logs to true', () {
+    expect(AppSettingsModel.fromJson({}).showApiLogs, isTrue);
+    expect(AppSettingsModel().showApiLogs, isTrue);
+  });
+
+  test('AppSettingsModel.fromJson parses show_api_logs snake_case', () {
+    expect(
+      AppSettingsModel.fromJson({'show_api_logs': false}).showApiLogs,
+      isFalse,
+    );
+    expect(
+      AppSettingsModel.fromJson({'show_api_logs': true}).showApiLogs,
+      isTrue,
+    );
+  });
+
+  test('AppSettingsModel.fromJson parses showApiLogs camelCase', () {
+    expect(
+      AppSettingsModel.fromJson({'showApiLogs': false}).showApiLogs,
+      isFalse,
+    );
+  });
+
+  test('AppSettingsModel.fromJson prefers show_api_logs over camelCase', () {
+    final m = AppSettingsModel.fromJson({
+      'show_api_logs': false,
+      'showApiLogs': true,
+    });
+    expect(m.showApiLogs, isFalse);
+  });
+
   test('AppSettingsModel.fromJson parses receipt printer fields', () {
     final m = AppSettingsModel.fromJson({
       'receiptPrinterEnabled': true,
@@ -64,12 +96,83 @@ void main() {
     expect(m.cameraSidecarPath, '/');
   });
 
+  test('AppSettingsModel.fromJson parses skipOfflineCashPin', () {
+    expect(
+      AppSettingsModel.fromJson({'skipOfflineCashPin': true}).skipOfflineCashPin,
+      isTrue,
+    );
+  });
+
+  test('AppSettingsModel.fromJson parses autoApproveCashPrint', () {
+    expect(
+      AppSettingsModel.fromJson({'autoApproveCashPrint': true})
+          .autoApproveCashPrint,
+      isTrue,
+    );
+  });
+
+  test('AppSettingsModel.fromJson parses offlineCashPins', () {
+    final m = AppSettingsModel.fromJson({
+      'offlineCashPins': ['1357', '9999', 'nope', 2468],
+    });
+    expect(m.offlineCashPins, ['1357', '9999', '2468']);
+  });
+
+  test('AppSettingsModel.fromJson parses receiptMerchant', () {
+    final m = AppSettingsModel.fromJson({
+      'receiptMerchant': {
+        'legalName': 'Sri Sarani Ventures Pvt Ltd',
+        'gstin': '36AAAAA0000A1Z5',
+        'gstRateBps': 1800,
+        'gstSplitMode': 'cgst_sgst',
+        'hsnSac': '998383',
+        'kioskCode': 'ODEON-01',
+      },
+    });
+    expect(m.receiptMerchant?.gstin, '36AAAAA0000A1Z5');
+    expect(m.receiptMerchant?.merchantName, contains('Sri Sarani'));
+    expect(m.receiptMerchant?.gstRateBps, 1800);
+  });
+
   test('KioskInfoModel.isValid requires id and code', () {
     expect(
       KioskInfoModel.fromJson({'id': 'k1', 'code': 'ABC'}).isValid,
       isTrue,
     );
     expect(KioskInfoModel.fromJson({'id': '', 'code': 'x'}).isValid, isFalse);
+  });
+
+  test('KioskInfoModel toJson round-trips through fromJson', () {
+    const original = KioskInfoModel(
+      id: 'k1',
+      code: 'ABC',
+      name: 'Lobby',
+      location: 'Floor 1',
+      accountId: 'a1',
+      paymentEnabled: false,
+      classicPhotosEnabled: false,
+      aiPhotosEnabled: false,
+      initialPrice: 100,
+      additionalPrintPrice: 50,
+      regenerationPrice: 75,
+      operatingMode: KioskInfoModel.operatingModeOffline,
+      invoiceLastSeq: 12,
+    );
+    final again = KioskInfoModel.fromJson(original.toJson());
+    expect(again.id, original.id);
+    expect(again.code, original.code);
+    expect(again.name, original.name);
+    expect(again.location, original.location);
+    expect(again.accountId, original.accountId);
+    expect(again.paymentEnabled, original.paymentEnabled);
+    expect(again.classicPhotosEnabled, original.classicPhotosEnabled);
+    expect(again.aiPhotosEnabled, original.aiPhotosEnabled);
+    expect(again.initialPrice, original.initialPrice);
+    expect(again.additionalPrintPrice, original.additionalPrintPrice);
+    expect(again.regenerationPrice, original.regenerationPrice);
+    expect(again.operatingMode, original.operatingMode);
+    expect(again.invoiceLastSeq, original.invoiceLastSeq);
+    expect(again.classicPoseCountdownSeconds, 10);
   });
 
   test('KioskInfoModel parses price overrides', () {
@@ -86,6 +189,70 @@ void main() {
     expect(m.regenerationPrice, 80);
     expect(m.paymentEnabled, isTrue);
     expect(m.classicPhotosEnabled, isTrue);
+  });
+
+  test('KioskInfoModel parses classicShotModes from num and string', () {
+    final m = KioskInfoModel.fromJson({
+      'id': 'k1',
+      'code': 'ABC',
+      'classicShotModes': [1, 3.2, '4', 'nope'],
+    });
+    expect(m.classicShotModes, [1, 3, 4]);
+  });
+
+  test('KioskInfoModel parses and clamps classicPoseCountdownSeconds', () {
+    expect(
+      KioskInfoModel.fromJson({'id': 'k1', 'code': 'ABC'})
+          .classicPoseCountdownSeconds,
+      10,
+    );
+    expect(
+      KioskInfoModel.fromJson({
+        'id': 'k1',
+        'code': 'ABC',
+        'classicPoseCountdownSeconds': 7,
+      }).classicPoseCountdownSeconds,
+      7,
+    );
+    expect(
+      KioskInfoModel.fromJson({
+        'id': 'k1',
+        'code': 'ABC',
+        'classic_pose_countdown_seconds': '4',
+      }).classicPoseCountdownSeconds,
+      5,
+    );
+    expect(
+      KioskInfoModel.fromJson({
+        'id': 'k1',
+        'code': 'ABC',
+        'classicPoseCountdownSeconds': 15.6,
+      }).classicPoseCountdownSeconds,
+      15,
+    );
+  });
+
+  test('KioskInfoModel aiPhotosEnabled defaults true and parses false', () {
+    expect(
+      KioskInfoModel.fromJson({'id': 'k1', 'code': 'ABC'}).aiPhotosEnabled,
+      isTrue,
+    );
+    expect(
+      KioskInfoModel.fromJson({
+        'id': 'k1',
+        'code': 'ABC',
+        'aiPhotosEnabled': false,
+      }).aiPhotosEnabled,
+      isFalse,
+    );
+    expect(
+      KioskInfoModel.fromJson({
+        'id': 'k1',
+        'code': 'ABC',
+        'ai_photos_enabled': 'off',
+      }).aiPhotosEnabled,
+      isFalse,
+    );
   });
 
   test('KioskInfoModel classicPhotosEnabled defaults and parses false', () {
@@ -147,6 +314,80 @@ void main() {
     );
   });
 
+  test('KioskInfoModel operatingMode defaults online and parses offline', () {
+    expect(
+      KioskInfoModel.fromJson({'id': 'k1', 'code': 'ABC'}).operatingMode,
+      KioskInfoModel.operatingModeOnline,
+    );
+    expect(
+      KioskInfoModel.fromJson({
+        'id': 'k1',
+        'code': 'ABC',
+        'operatingMode': 'offline',
+      }).isOperatingModeOffline,
+      isTrue,
+    );
+    expect(
+      KioskInfoModel.fromJson({
+        'id': 'k1',
+        'code': 'ABC',
+        'operating_mode': 'OFFLINE',
+      }).isOperatingModeOffline,
+      isTrue,
+    );
+    expect(
+      KioskInfoModel.fromJson({
+        'id': 'k1',
+        'code': 'ABC',
+        'operatingMode': true,
+      }).isOperatingModeOffline,
+      isTrue,
+    );
+    expect(
+      KioskInfoModel.fromJson({
+        'id': 'k1',
+        'code': 'ABC',
+        'operatingMode': 0,
+      }).isOperatingModeOffline,
+      isFalse,
+    );
+    expect(
+      KioskInfoModel.fromJson({
+        'id': 'k1',
+        'code': 'ABC',
+        'operatingMode': 1,
+      }).isOperatingModeOffline,
+      isTrue,
+    );
+    expect(
+      KioskInfoModel.fromJson({
+        'id': 'k1',
+        'code': 'ABC',
+        'operatingMode': false,
+      }).isOperatingModeOffline,
+      isFalse,
+    );
+    for (final flag in ['off', 'true', '1', 'yes']) {
+      expect(
+        KioskInfoModel.fromJson({
+          'id': 'k1',
+          'code': 'ABC',
+          'operatingMode': flag,
+        }).isOperatingModeOffline,
+        isTrue,
+        reason: '"$flag" should mean offline',
+      );
+    }
+    expect(
+      KioskInfoModel.fromJson({
+        'id': 'k1',
+        'code': 'ABC',
+        'operatingMode': 'online',
+      }).isOperatingModeOffline,
+      isFalse,
+    );
+  });
+
   test('KioskFrameModel.fromJson', () {
     const f = KioskFrameModel(
       id: 'f1',
@@ -154,6 +395,46 @@ void main() {
       overlayUrl: 'https://cdn.example/o.png',
     );
     expect(f.id, 'f1');
+  });
+
+  test('KioskFrameModel.toJson includes scheduled dates', () {
+    final start = DateTime.utc(2026, 8, 1);
+    final end = DateTime.utc(2026, 8, 31);
+    final f = KioskFrameModel(
+      id: 'f1',
+      name: 'Frame',
+      overlayUrl: 'https://cdn.example/o.png',
+      scheduledStartAt: start,
+      scheduledEndAt: end,
+    );
+    expect(f.toJson()['scheduledStartAt'], start.toIso8601String());
+    expect(f.toJson()['scheduledEndAt'], end.toIso8601String());
+  });
+
+  test('KioskFrameModel round-trips strip overlay variants', () {
+    const slots = [
+      StripTemplateSlot(left: 0.08, top: 0.16, width: 0.84, height: 0.155),
+    ];
+    const original = KioskFrameModel(
+      id: 'dps-1',
+      name: 'Delhi Public School',
+      overlayUrl: 'https://cdn.example/ai.png',
+      landscapeOverlayUrl: 'https://cdn.example/ai-6x4.png',
+      strip: KioskFrameStripAssets(
+        overlayUrl: 'https://cdn.example/6x2.png',
+        overlay3Url: 'https://cdn.example/6x2-3.png',
+        slots: slots,
+        slots3: slots,
+      ),
+    );
+    final parsed = KioskFrameModel.fromJson(original.toJson());
+    expect(parsed.strip.overlayUrl, 'https://cdn.example/6x2.png');
+    expect(parsed.landscapeOverlayUrl, 'https://cdn.example/ai-6x4.png');
+    expect(parsed.strip.overlay3Url, 'https://cdn.example/6x2-3.png');
+    expect(parsed.strip.has4, isTrue);
+    expect(parsed.strip.has3, isTrue);
+    expect(parsed.strip.slots.single.left, 0.08);
+    expect(parsed.strip.slots3.single.top, 0.16);
   });
 
   test('KioskShareLinkModel.fromJson', () {

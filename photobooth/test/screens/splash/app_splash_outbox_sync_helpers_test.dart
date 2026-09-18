@@ -1,0 +1,41 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:photobooth/screens/splash/app_splash_outbox_sync_helpers.dart';
+import 'package:photobooth/services/kiosk_outbox_worker.dart';
+import 'package:photobooth/utils/app_strings.dart';
+
+void main() {
+  test('splashOutboxSyncResultMessage for caught up vs remaining', () {
+    expect(
+      splashOutboxSyncResultMessage(
+        const KioskOutboxDrainResult(completed: 3, remaining: 0, failed: 0),
+      ),
+      AppStrings.splashSyncCompleteToast,
+    );
+    expect(
+      splashOutboxSyncResultMessage(
+        const KioskOutboxDrainResult(completed: 1, remaining: 4, failed: 1),
+      ),
+      AppStrings.splashSyncPartialToast(4),
+    );
+  });
+
+  test('splashOutboxSyncAvailable is native-only', () {
+    expect(splashOutboxSyncAvailable(isWeb: true, hasWorker: true), isFalse);
+    expect(splashOutboxSyncAvailable(isWeb: false, hasWorker: false), isFalse);
+    expect(splashOutboxSyncAvailable(isWeb: false, hasWorker: true), isTrue);
+    expect(splashOutboxSyncAvailable(isWeb: false), isFalse);
+    expect(splashOutboxSyncAvailable(hasWorker: true), isTrue);
+  });
+
+  test('splashOutboxSyncUnavailableMessage is browser-specific', () {
+    expect(
+      splashOutboxSyncUnavailableMessage(),
+      AppStrings.splashSyncUnavailableInBrowser,
+    );
+  });
+
+  test('splashSyncPending singular when one item is waiting', () {
+    expect(AppStrings.splashSyncPending(1, 0), '1 item waiting to sync');
+    expect(AppStrings.splashSyncPending(2, 0), '2 items waiting to sync');
+  });
+}

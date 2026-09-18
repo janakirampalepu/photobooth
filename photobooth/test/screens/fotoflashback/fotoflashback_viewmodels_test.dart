@@ -7,12 +7,15 @@ import 'package:cross_file/cross_file.dart';
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:image/image.dart' as img;
+import 'package:photobooth/models/kiosk_frame_model.dart';
 import 'package:photobooth/models/strip_models.dart';
 import 'package:photobooth/screens/fotoflashback/fotoflashback_capture_viewmodel.dart';
 import 'package:photobooth/screens/fotoflashback/fotoflashback_filter_viewmodel.dart';
 import 'package:photobooth/screens/photo_capture/photo_model.dart';
 import 'package:photobooth/screens/photo_generate/photo_generate_viewmodel.dart';
+import 'package:photobooth/services/local_guest_media_write.dart';
 import 'package:photobooth/services/session_manager.dart';
+import 'package:photobooth/services/local_session_skeleton.dart';
 import 'package:photobooth/utils/app_strings.dart';
 import 'package:photobooth/utils/classic_strip_scrub_coordinator.dart';
 import 'package:photobooth/utils/constants.dart';
@@ -32,20 +35,44 @@ String _tinyJpegDataUrl() {
       '${base64Encode(img.encodeJpg(src, quality: 90))}';
 }
 
+Uint8List _solidOverlayPng() {
+  final image = img.Image(width: 20, height: 30, numChannels: 4);
+  img.fill(image, color: img.ColorRgba8(0, 160, 40, 255));
+  img.fillRect(
+    image,
+    x1: 2,
+    y1: 5,
+    x2: 17,
+    y2: 22,
+    color: img.ColorRgba8(0, 0, 0, 0),
+  );
+  return Uint8List.fromList(img.encodePng(image));
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   SharedPreferences.setMockInitialValues({});
 
   setUp(() {
     ClassicStripScrubCoordinator.instance.resetForTests();
+    SessionManager().clearSession();
+    FotoFlashbackFilterViewModel.composePrepareJoinTimeoutForTest =
+        const Duration(seconds: 2);
     FotoFlashbackFilterViewModel.composeWarmJoinTimeoutForTest =
         const Duration(seconds: 45);
+    debugGuestMediaFetchBytes = (_) async {
+      throw StateError('skip remote persist in unit tests');
+    };
   });
 
   tearDown(() {
     ClassicStripScrubCoordinator.instance.resetForTests();
+    SessionManager().clearSession();
+    FotoFlashbackFilterViewModel.composePrepareJoinTimeoutForTest =
+        const Duration(seconds: 2);
     FotoFlashbackFilterViewModel.composeWarmJoinTimeoutForTest =
         const Duration(seconds: 45);
+    debugGuestMediaFetchBytes = null;
   });
 
   final stripTheme = sampleTheme('strip1').copyWith((p) {
@@ -70,6 +97,7 @@ void main() {
     expect(vm.canCompose, isTrue);
     expect(vm.selectedFilterId, kDefaultStripFilterId);
     expect(vm.printOrientation, PrintOrientation.portrait);
+    expect(vm.classicOverlayCleanupEnabled, isFalse);
   });
 
   test('FotoFlashbackFilterViewModel hydrates pending capture file paths',
@@ -79,6 +107,7 @@ void main() {
     await File(path).writeAsBytes(kTinyJpegBytes);
 
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: const [],
       pendingImageFilePaths: [path],
@@ -93,9 +122,38 @@ void main() {
     }
 
     expect(vm.isHydratingCaptures, isFalse);
+    expect(vm.hasLookPreviewJpegBytes, isTrue);
+    expect(vm.lookPreviewJpegBytes, hasLength(1));
     expect(vm.imageDataUrls, hasLength(1));
     expect(vm.imageDataUrls.first, startsWith('data:image/jpeg;base64,'));
     expect(vm.canCompose, isTrue);
+  });
+
+  test('FotoFlashbackFilterViewModel hydrate surfaces an empty capture file',
+      () async {
+    // A direct-PTP path that exists but holds no bytes: the transfer was cut
+    // short. Compose would reject it later, so the look screen has to say so.
+    final path =
+        '${Directory.systemTemp.path}/ptp_hydrate_empty_${DateTime.now().microsecondsSinceEpoch}.jpg';
+    await File(path).writeAsBytes(Uint8List(0));
+
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: const [],
+      pendingImageFilePaths: [path],
+      overlayCleanupBuildGate: false,
+    );
+
+    for (var i = 0; i < 50 && vm.isHydratingCaptures; i++) {
+      await pumpEventQueue();
+    }
+
+    expect(vm.isHydratingCaptures, isFalse);
+    expect(vm.errorMessage, AppStrings.flashbackFinishEncodeFailed);
+    expect(vm.hasLookPreviewJpegBytes, isFalse);
+    expect(vm.imageDataUrls, isEmpty);
+    expect(vm.canCompose, isFalse);
   });
 
   test('FotoFlashbackFilterViewModel hydrate kicks off overlay scrub after encode',
@@ -107,6 +165,7 @@ void main() {
     final api = _CountingScrubFakeApi();
 
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: const [],
       pendingImageFilePaths: [path],
@@ -124,6 +183,7 @@ void main() {
 
   test('FotoFlashbackFilterViewModel hydrate reports encode failure', () async {
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: const [],
       pendingImageFilePaths: ['/nonexistent/ptp_hydrate_missing.jpg'],
@@ -140,8 +200,9 @@ void main() {
   });
 
   test('FotoFlashbackFilterViewModel clearCapturePreview drops stale bytes',
-      () {
+      () async {
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: [_tinyJpegDataUrl()],
       overlayCleanupBuildGate: false,
@@ -149,10 +210,15 @@ void main() {
     expect(vm.previewImageDataUrls, isNotEmpty);
 
     vm.clearCapturePreview();
+    for (var i = 0; i < 20; i++) {
+      await pumpEventQueue();
+    }
 
     expect(vm.previewImageDataUrls, isEmpty);
     expect(vm.imageDataUrls, isEmpty);
+    expect(vm.hasLookPreviewJpegBytes, isFalse);
     expect(vm.canCompose, isFalse);
+    vm.dispose();
   });
 
   test(
@@ -164,6 +230,7 @@ void main() {
     await File(path).writeAsBytes(kTinyJpegBytes);
 
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: const [],
       pendingImageFilePaths: [path],
@@ -180,6 +247,7 @@ void main() {
 
   test('FotoFlashbackFilterViewModel print orientation for 1-shot only', () {
     final single = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: ['data:image/jpeg;base64,/9j/4AAQ'],
     );
@@ -190,6 +258,7 @@ void main() {
     expect(single.printOrientation, PrintOrientation.portrait);
 
     final four = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
     );
@@ -202,6 +271,7 @@ void main() {
     final api = _FlakyScrubFakeApi();
     SessionManager().setSessionFromResponse(_sessionJson('sess-retry-scrub'));
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,shot'),
       apiService: api,
@@ -242,6 +312,7 @@ void main() {
     }
 
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List<String>.from(urls),
       apiService: lookApi,
@@ -287,6 +358,7 @@ void main() {
       await ClassicStripScrubCoordinator.instance.awaitAll();
 
       final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
         theme: stripTheme,
         imageDataUrls: List<String>.from(urls),
         apiService: lookApi,
@@ -327,6 +399,7 @@ void main() {
       await ClassicStripScrubCoordinator.instance.awaitAll();
 
       final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
         theme: stripTheme,
         imageDataUrls: List<String>.from(urls),
         apiService: lookApi,
@@ -352,6 +425,7 @@ void main() {
     final api = _EmptyScrubFakeApi();
     SessionManager().setSessionFromResponse(_sessionJson('sess-empty-scrub'));
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,shot'),
       apiService: api,
@@ -376,6 +450,7 @@ void main() {
       );
     }
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,shot'),
       apiService: lookApi,
@@ -397,6 +472,7 @@ void main() {
     SessionManager().clearSession();
     SessionManager().setSessionFromResponse(_sessionJson('sess-throw-scrub'));
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,shot'),
       apiService: api,
@@ -411,6 +487,64 @@ void main() {
     expect(vm.isPreparingPreview, isFalse);
     await vm.preparePreview();
     expect(vm.previewCleaned, isFalse);
+  });
+
+  test('FotoFlashbackFilterViewModel follows a three-shot strip', () {
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: List.filled(3, 'data:image/jpeg;base64,/9j/4AAQ'),
+      overlayCleanupBuildGate: false,
+    );
+    expect(vm.isSingleClassic, isFalse);
+    expect(vm.shotCount, 3);
+    expect(vm.stripShotCount, 3);
+    expect(vm.canCompose, isTrue);
+    // Same fixed 2×6 print, taller cells than the four-shot strip.
+    expect(vm.stripCellAspectRatio, closeTo(580 / (1760 / 3), 0.0001));
+    expect(vm.stripCellAspectRatio, lessThan(kStripCellAspectRatio));
+    // Sheet layouts hardcode four slots, so they stay hidden for three shots.
+    expect(vm.frames.any((f) => isStripSheetLayout(f.id)), isFalse);
+    // One sticker per photo cell — three, not four.
+    vm.addSticker('hearts');
+    expect(vm.stickerPlacements, hasLength(3));
+  });
+
+  test('FotoFlashbackCaptureViewModel collects three shots when asked', () {
+    final vm = FotoFlashbackCaptureViewModel(
+      theme: stripTheme,
+      totalShots: kStripShotCountThree,
+    );
+    for (var i = 0; i < kStripShotCountThree; i++) {
+      expect(vm.isComplete, isFalse);
+      expect(vm.nextShotNumber, i + 1);
+      vm.addShot(
+        PhotoModel(
+          id: 't$i',
+          imageFile: XFile.fromData(
+            Uint8List.fromList([0xFF, 0xD8, 0xFF, i]),
+            name: 't$i.jpg',
+            mimeType: 'image/jpeg',
+          ),
+          capturedAt: DateTime.utc(2026, 1, 1),
+        ),
+      );
+    }
+    expect(vm.isComplete, isTrue);
+    expect(vm.shotCount, kStripShotCountThree);
+    // A fourth shot is refused — the strip is already full.
+    vm.addShot(
+      PhotoModel(
+        id: 'extra',
+        imageFile: XFile.fromData(
+          Uint8List.fromList([0xFF, 0xD8, 0xFF]),
+          name: 'extra.jpg',
+          mimeType: 'image/jpeg',
+        ),
+        capturedAt: DateTime.utc(2026, 1, 1),
+      ),
+    );
+    expect(vm.shotCount, kStripShotCountThree);
   });
 
   test('FotoFlashbackCaptureViewModel collects four shots', () {
@@ -460,6 +594,7 @@ void main() {
     final api = _StripFakeApi();
     SessionManager().setSessionFromResponse(_sessionJson('sess-1'));
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: api,
@@ -522,6 +657,7 @@ void main() {
     final api = _StripFakeApi(enableOsdScrub: false);
     SessionManager().setSessionFromResponse(_sessionJson('sess-scrub-off'));
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: api,
@@ -542,6 +678,7 @@ void main() {
     final api = _StripFakeApi(enableOsdScrub: true);
     SessionManager().setSessionFromResponse(_sessionJson('sess-scrub-settings-off'));
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: api,
@@ -558,6 +695,7 @@ void main() {
 
   test('FotoFlashbackFilterViewModel stays scrub-off before catalog loads', () {
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: _StripFakeApi(enableOsdScrub: true),
@@ -568,6 +706,7 @@ void main() {
 
   test('FotoFlashbackFilterViewModel scribble draw/undo/clear', () {
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: _StripFakeApi(),
@@ -595,6 +734,7 @@ void main() {
 
   test('FotoFlashbackFilterViewModel sticker add/move/clear', () {
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: _StripFakeApi(),
@@ -623,6 +763,7 @@ void main() {
     final api = _StripFakeApi(failCompose: true);
     SessionManager().setSessionFromResponse(_sessionJson('sess-1'));
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: api,
@@ -632,9 +773,162 @@ void main() {
     expect(vm.errorMessage, 'compose down');
   });
 
+  test('FotoFlashbackFilterViewModel uses local look when session is offline',
+      () async {
+    SessionManager().setSessionFromResponse({
+      ..._sessionJson('sess-offline'),
+      kKioskSessionOfflineKey: true,
+    });
+    final api = _StripFakeApi(failCompose: true);
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: List.filled(4, _tinyJpegDataUrl()),
+      apiService: api,
+    );
+    final image = await vm.compose();
+    expect(image, isNotNull);
+    expect(image!.imageUrl, isNotEmpty);
+    expect(api.composeCalls, 0);
+    expect(SessionManager().isOfflineSession, isTrue);
+  });
+
+  test('FotoFlashbackFilterViewModel event kiosk stamps locally without Fly',
+      () async {
+    SessionManager().setSessionFromResponse(_sessionJson('sess-event-local'));
+    final api = _StripFakeApi();
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: true,
+      theme: stripTheme,
+      imageDataUrls: List.filled(4, _tinyJpegDataUrl()),
+      apiService: api,
+      overlayCleanupBuildGate: true,
+      enableOsdScrub: true,
+    );
+    await vm.loadFilters();
+    expect(api.getKioskFramesCalls, greaterThan(0));
+    expect(vm.classicOverlayCleanupEnabled, isFalse);
+    final image = await vm.compose();
+    expect(image, isNotNull);
+    expect(image!.imageUrl, isNotEmpty);
+    expect(api.composeCalls, 0);
+    expect(SessionManager().isOfflineSession, isFalse);
+    await vm.refreshComposePreview();
+    expect(api.composeCalls, 0);
+    vm.dispose();
+  });
+
+  test('FotoFlashbackFilterViewModel 3-shot local warm then Continue skips Fly',
+      () async {
+    SessionManager().setSessionFromResponse(_sessionJson('sess-event-3shot'));
+    final api = _StripFakeApi();
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: true,
+      theme: stripTheme,
+      imageDataUrls: List.filled(3, _tinyJpegDataUrl()),
+      apiService: api,
+      overlayCleanupBuildGate: true,
+    );
+    await vm.loadFilters();
+    await vm.refreshComposePreview();
+    expect(api.composeCalls, 0);
+    final image = await vm.compose();
+    expect(image, isNotNull);
+    expect(api.composeCalls, 0);
+    vm.dispose();
+  });
+
+  test('FotoFlashbackFilterViewModel 4-shot local warm then Continue skips Fly',
+      () async {
+    SessionManager().setSessionFromResponse(_sessionJson('sess-event-4shot'));
+    final api = _StripFakeApi();
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: true,
+      theme: stripTheme,
+      imageDataUrls: List.filled(4, _tinyJpegDataUrl()),
+      apiService: api,
+      overlayCleanupBuildGate: true,
+    );
+    await vm.loadFilters();
+    await vm.refreshComposePreview();
+    expect(api.composeCalls, 0);
+    final image = await vm.compose();
+    expect(image, isNotNull);
+    expect(api.composeCalls, 0);
+    vm.dispose();
+  });
+
+  test('FotoFlashbackFilterViewModel 1-shot local warm then Continue skips Fly',
+      () async {
+    SessionManager().setSessionFromResponse(_sessionJson('sess-event-1shot'));
+    final api = _StripFakeApi();
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: true,
+      theme: stripTheme,
+      imageDataUrls: [_tinyJpegDataUrl()],
+      apiService: api,
+      overlayCleanupBuildGate: false,
+    );
+    await vm.loadFilters();
+    await vm.refreshComposePreview();
+    expect(api.composeCalls, 0);
+    final image = await vm.compose();
+    expect(image, isNotNull);
+    expect(api.composeCalls, 0);
+    vm.dispose();
+  });
+
+  test('FotoFlashbackFilterViewModel local look fails when shots have no pixels',
+      () async {
+    SessionManager().setSessionFromResponse({
+      ..._sessionJson('sess-offline-empty'),
+      kKioskSessionOfflineKey: true,
+    });
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: List.filled(4, '   '),
+      apiService: _StripFakeApi(),
+    );
+    expect(await vm.compose(), isNull);
+    expect(vm.errorMessage, AppStrings.flashbackComposeFailed);
+  });
+
+  test('FotoFlashbackFilterViewModel uses local look on WAN-down compose',
+      () async {
+    SessionManager().setSessionFromResponse(_sessionJson('sess-wan'));
+    final api = _StripFakeApi(failComposeWan: true);
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: List.filled(4, _tinyJpegDataUrl()),
+      apiService: api,
+    );
+    final image = await vm.compose();
+    expect(image, isNotNull);
+    expect(api.composeCalls, 1);
+    expect(SessionManager().isOfflineSession, isTrue);
+  });
+
+  test('FotoFlashbackFilterViewModel uses local look on compose 400', () async {
+    SessionManager().setSessionFromResponse(_sessionJson('sess-400'));
+    final api = _StripFakeApi(failCompose400: true);
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: List.filled(4, _tinyJpegDataUrl()),
+      apiService: api,
+    );
+    final image = await vm.compose();
+    expect(image, isNotNull);
+    expect(api.composeCalls, 1);
+    expect(SessionManager().isOfflineSession, isFalse);
+  });
+
   test('FotoFlashbackFilterViewModel handles load/compose edge cases', () async {
     SessionManager().clearSession();
     final shortVm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: const ['a', 'b'],
       apiService: _StripFakeApi(),
@@ -644,6 +938,7 @@ void main() {
     expect(shortVm.errorMessage, isNotNull);
 
     final singleVm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: const ['data:image/jpeg;base64,/9j/4AAQ'],
       apiService: _StripFakeApi(),
@@ -655,15 +950,20 @@ void main() {
 
     SessionManager().clearSession();
     final noSession = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: _StripFakeApi(),
+      overlayCleanupBuildGate: false,
     );
-    expect(await noSession.compose(), isNull);
-    expect(noSession.errorMessage, isNotNull);
+    expect(await noSession.compose(), isNotNull);
+    expect(SessionManager().sessionId, isNotNull);
+    noSession.dispose();
 
+    SessionManager().setSessionFromResponse(_sessionJson('online-catalog'));
     final apiFail = _StripFakeApi(failLoad: true);
     final loadFail = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: apiFail,
@@ -673,8 +973,185 @@ void main() {
     expect(loadFail.filters, isNotEmpty);
     expect(loadFail.canCompose, isTrue);
 
+    SessionManager().setSessionFromResponse({
+      ..._sessionJson('offline-looks'),
+      'offline': true,
+    });
+    final offlineLooks = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
+      apiService: _StripFakeApi(failLoad: true),
+    );
+    await offlineLooks.loadFilters();
+    expect(offlineLooks.errorMessage, isNull);
+    expect(offlineLooks.filters, isNotEmpty);
+    offlineLooks.dispose();
+
+    SessionManager().setSessionFromResponse({
+      ..._sessionJson('offline-dps'),
+      kKioskSessionOfflineKey: true,
+    });
+    const dps = KioskFrameModel(
+      id: 'dps-1',
+      name: 'Delhi Public School',
+      overlayUrl: 'https://cdn.example/dps.png',
+      strip: KioskFrameStripAssets(
+        overlayUrl: 'https://cdn.example/dps-6x2.png',
+        overlay3Url: 'https://cdn.example/dps-3.png',
+      ),
+    );
+    final dpsApi = _StripFakeApi(failLoad: true, kioskFrames: [dps]);
+    final offlineDpsOne = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: const ['data:image/jpeg;base64,/9j/4AAQ'],
+      apiService: dpsApi,
+      overlayCleanupBuildGate: false,
+    );
+    await offlineDpsOne.loadFilters();
+    expect(offlineDpsOne.errorMessage, isNull);
+    expect(offlineDpsOne.frames.any((f) => f.id == 'ai:dps-1'), isTrue);
+    expect(offlineDpsOne.selectedFrameId, 'ai:dps-1');
+    expect(
+      await offlineDpsOne.compose(),
+      isNotNull,
+      reason: 'occasion chrome without cached PNG still prints',
+    );
+    offlineDpsOne.dispose();
+
+    final overlayPng = _solidOverlayPng();
+    final stamped = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: [_tinyJpegDataUrl()],
+      apiService: dpsApi,
+      overlayCleanupBuildGate: false,
+      overlayBytesLookup: (frame) async {
+        expect(frame.id, 'ai:dps-1');
+        return overlayPng;
+      },
+    );
+    await stamped.loadFilters();
+    expect(await stamped.compose(), isNotNull);
+    stamped.dispose();
+
+    final emptyOverlay = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: [_tinyJpegDataUrl()],
+      apiService: dpsApi,
+      overlayCleanupBuildGate: false,
+      overlayBytesLookup: (_) async => Uint8List(0),
+    );
+    await emptyOverlay.loadFilters();
+    expect(await emptyOverlay.compose(), isNotNull);
+    emptyOverlay.dispose();
+
+    final throwingOverlay = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: [_tinyJpegDataUrl()],
+      apiService: dpsApi,
+      overlayCleanupBuildGate: false,
+      overlayBytesLookup: (_) async => throw StateError('cache boom'),
+    );
+    await throwingOverlay.loadFilters();
+    expect(await throwingOverlay.compose(), isNotNull);
+    throwingOverlay.dispose();
+
+    String? landscapeLookupUrl;
+    final landscapeDps = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: true,
+      theme: stripTheme,
+      imageDataUrls: [_tinyJpegDataUrl()],
+      apiService: _StripFakeApi(
+        failLoad: true,
+        kioskFrames: [
+          const KioskFrameModel(
+            id: 'dps-1',
+            name: 'Delhi Public School',
+            overlayUrl: 'https://cdn.example/dps.png',
+            landscapeOverlayUrl: 'https://cdn.example/dps-6x4.png',
+          ),
+        ],
+      ),
+      overlayCleanupBuildGate: false,
+      overlayBytesLookup: (frame) async {
+        landscapeLookupUrl = frame.overlayUrl;
+        return overlayPng;
+      },
+    );
+    await landscapeDps.loadFilters();
+    landscapeDps.selectPrintOrientation(PrintOrientation.landscape);
+    expect(await landscapeDps.compose(), isNotNull);
+    expect(landscapeLookupUrl, 'https://cdn.example/dps-6x4.png');
+    landscapeDps.dispose();
+
+    final offlineDpsFour = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
+      apiService: dpsApi,
+      overlayCleanupBuildGate: false,
+    );
+    await offlineDpsFour.loadFilters();
+    expect(offlineDpsFour.selectedFrameId, 'fr:dps-1');
+    offlineDpsFour.dispose();
+
+    final offlineDpsThree = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: List.filled(3, 'data:image/jpeg;base64,/9j/4AAQ'),
+      apiService: dpsApi,
+      overlayCleanupBuildGate: false,
+    );
+    await offlineDpsThree.loadFilters();
+    expect(offlineDpsThree.selectedFrameId, 'f3:dps-1');
+    offlineDpsThree.dispose();
+
+    final throwingCache = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: const ['data:image/jpeg;base64,/9j/4AAQ'],
+      apiService: _ThrowingCachedFramesApi(),
+      overlayCleanupBuildGate: false,
+    );
+    await throwingCache.loadFilters();
+    expect(throwingCache.errorMessage, isNull);
+    expect(throwingCache.filters, isNotEmpty);
+    throwingCache.dispose();
+
+    final liveFail = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: const ['data:image/jpeg;base64,/9j/4AAQ'],
+      apiService: _StripFakeApi(
+        failLoad: true,
+        framesThrow: true,
+        kioskFrames: [dps],
+      ),
+      overlayCleanupBuildGate: false,
+    );
+    await liveFail.loadFilters();
+    expect(liveFail.frames.any((f) => f.id == 'ai:dps-1'), isTrue);
+    liveFail.dispose();
+
+    SessionManager().setSessionFromResponse(_sessionJson('dns-looks'));
+    final dnsLooks = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
+      apiService: _StripFakeApi(failLoadHostLookup: true),
+    );
+    await dnsLooks.loadFilters();
+    expect(dnsLooks.errorMessage, isNull);
+    expect(dnsLooks.filters, isNotEmpty);
+    dnsLooks.dispose();
+
     final apiBoom = _StripFakeApi(throwGenericLoad: true);
     final loadBoom = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: apiBoom,
@@ -686,6 +1163,7 @@ void main() {
     final apiComposeBoom = _StripFakeApi(throwGenericCompose: true);
     SessionManager().setSessionFromResponse(_sessionJson('sess-1'));
     final composeBoom = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: apiComposeBoom,
@@ -695,6 +1173,7 @@ void main() {
 
     final monoOnly = _StripFakeApi(monoOnly: true);
     final resetDefault = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: monoOnly,
@@ -708,6 +1187,7 @@ void main() {
 
     final altChrome = _StripFakeApi(altChromeOnly: true);
     final resetChrome = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: altChrome,
@@ -721,6 +1201,7 @@ void main() {
     final api = _SheetFramesFakeApi();
     SessionManager().setSessionFromResponse(_sessionJson('sess-sheet'));
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: api,
@@ -759,6 +1240,7 @@ void main() {
     final api = _StripFakeApi();
     SessionManager().setSessionFromResponse(_sessionJson('sess-draw'));
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,shot'),
       apiService: api,
@@ -791,6 +1273,7 @@ void main() {
   test('FotoFlashbackFilterViewModel single classic hides sheet frames', () async {
     final api = _SheetFramesFakeApi();
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: const ['data:image/jpeg;base64,/9j/4AAQ'],
       apiService: api,
@@ -805,9 +1288,80 @@ void main() {
     expect(vm.stickerPlacements, hasLength(1));
   });
 
+  test('FotoFlashbackFilterViewModel filters occasion frames by shot count',
+      () async {
+    final api = _TemplateFramesFakeApi();
+    final three = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: List.filled(3, 'data:image/jpeg;base64,/9j/4AAQ'),
+      apiService: api,
+    );
+    await three.loadFilters();
+    expect(three.supportsSheetLayouts, isFalse);
+    expect(three.frames.any((f) => f.id.startsWith('st:')), isFalse);
+    expect(three.frames.any((f) => f.id.startsWith('fr:')), isFalse);
+    expect(three.frames.any((f) => f.id.startsWith('ai:')), isFalse);
+    expect(three.frames.any((f) => f.id == 'f3:frame-1'), isTrue);
+    expect(three.selectedFrameId, 'f3:frame-1');
+    three.selectFrame('fr:frame-1');
+    expect(three.selectedFrameId, isNot('fr:frame-1'));
+
+    final four = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
+      apiService: api,
+    );
+    await four.loadFilters();
+    expect(four.frames.any((f) => f.id == 'fr:frame-1'), isTrue);
+    expect(four.frames.any((f) => f.id.startsWith('f3:')), isFalse);
+    expect(four.selectedFrameId, 'fr:frame-1');
+    four.selectFrame('fr:frame-1');
+    expect(four.selectedFrameId, 'fr:frame-1');
+
+    final one = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: const ['data:image/jpeg;base64,/9j/4AAQ'],
+      apiService: api,
+    );
+    await one.loadFilters();
+    expect(one.frames.any((f) => f.id == 'ai:frame-1'), isTrue);
+    expect(one.frames.any((f) => f.id.startsWith('fr:')), isFalse);
+    expect(one.selectedFrameId, 'ai:frame-1');
+    one.selectFrame('f3:frame-1');
+    expect(one.selectedFrameId, isNot('f3:frame-1'));
+  });
+
+  test('FotoFlashbackFilterViewModel merges cached kiosk frames into live catalog',
+      () async {
+    SessionManager().setSessionFromResponse(_sessionJson('sess-merge-dps'));
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: const ['data:image/jpeg;base64,/9j/4AAQ'],
+      apiService: _StripFakeApi(
+        kioskFrames: const [
+          KioskFrameModel(
+            id: 'dps-1',
+            name: 'Delhi Public School',
+            overlayUrl: 'https://cdn.example/dps.png',
+          ),
+        ],
+      ),
+      overlayCleanupBuildGate: false,
+    );
+    await vm.loadFilters();
+    expect(vm.frames.any((f) => f.id == 'ai:dps-1'), isTrue);
+    expect(vm.selectedFrameId, 'ai:dps-1');
+    vm.dispose();
+  });
+
   test('FotoFlashbackFilterViewModel refreshPreviewGrade no-ops off strip count',
       () async {
     final single = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: const ['data:image/jpeg;base64,/9j/4AAQ'],
       apiService: _StripFakeApi(),
@@ -820,6 +1374,7 @@ void main() {
       () async {
     final api = _SheetOnlyFakeApi();
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: const ['data:image/jpeg;base64,/9j/4AAQ'],
       apiService: api,
@@ -833,6 +1388,7 @@ void main() {
   test('FotoFlashbackFilterViewModel scrub dots show failed after pass', () async {
     SessionManager().setSessionFromResponse(_sessionJson('sess-dots'));
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,shot'),
       apiService: _EmptyScrubFakeApi(),
@@ -848,6 +1404,7 @@ void main() {
     final api = _PlainSheetFakeApi();
     SessionManager().setSessionFromResponse(_sessionJson('sess-plain'));
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,shot'),
       apiService: api,
@@ -863,6 +1420,7 @@ void main() {
     SessionManager().setSessionFromResponse(_sessionJson('sess-grade-cache'));
     final api = _CountingGradeFakeApi();
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: api,
@@ -880,6 +1438,7 @@ void main() {
     final api = _StripFakeApi();
     final fat = 'data:image/jpeg;base64,${'A' * 60000}';
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, fat),
       apiService: api,
@@ -897,6 +1456,7 @@ void main() {
     SessionManager().setSessionFromResponse(_sessionJson('sess-no-rescrub'));
     final api = _ThrowingScrubFakeApi();
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,shot'),
       apiService: api,
@@ -921,6 +1481,7 @@ void main() {
   test('FotoFlashbackFilterViewModel compose prepares uncleaned preview', () async {
     SessionManager().setSessionFromResponse(_sessionJson('sess-compose-prep'));
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,shot'),
       apiService: _StripFakeApi(),
@@ -936,6 +1497,7 @@ void main() {
   test('FotoFlashbackFilterViewModel single classic clears sheet frame on load',
       () async {
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: const ['data:image/jpeg;base64,/9j/4AAQ'],
       apiService: _SheetFramesFakeApi(),
@@ -948,6 +1510,7 @@ void main() {
   test('FotoFlashbackFilterViewModel exposes pen width and initial scrub dots',
       () async {
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,shot'),
       apiService: _StripFakeApi(),
@@ -962,6 +1525,7 @@ void main() {
     SessionManager().setSessionFromResponse(_sessionJson('sess-grading-flag'));
     final api = _SlowGradeFakeApi();
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: api,
@@ -979,6 +1543,7 @@ void main() {
   test('FotoFlashbackFilterViewModel pending scrub dots while preparing', () async {
     SessionManager().setSessionFromResponse(_sessionJson('sess-pending-dots'));
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,shot'),
       apiService: _SlowScrubFakeApi(),
@@ -994,6 +1559,7 @@ void main() {
 
   test('FotoFlashbackFilterViewModel canUndo with active scribble point', () {
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: _StripFakeApi(),
@@ -1006,6 +1572,7 @@ void main() {
 
   test('FotoFlashbackFilterViewModel exposes idle compose-refresh getters', () {
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: _StripFakeApi(),
@@ -1015,9 +1582,127 @@ void main() {
     vm.dispose();
   });
 
+  test('FotoFlashbackFilterViewModel event-local look taps skip print-twin warm',
+      () async {
+    SessionManager().setSessionFromResponse(_sessionJson('sess-look-tap'));
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: true,
+      theme: stripTheme,
+      imageDataUrls: List.filled(4, _tinyJpegDataUrl()),
+      apiService: _StripFakeApi(),
+      overlayCleanupBuildGate: false,
+    );
+    await vm.loadFilters();
+    expect(vm.filters, isNotEmpty);
+    expect(vm.isWarmingPrintPreview, isFalse);
+
+    final other = vm.filters.firstWhere(
+      (f) => f.id != vm.selectedFilterId,
+      orElse: () => vm.filters.first,
+    );
+    vm.selectFilter(other.id);
+    if (vm.frames.length > 1) {
+      vm.selectFrame(vm.frames[1].id);
+    }
+    vm.addSticker('hearts');
+    await pumpEventQueue();
+    expect(vm.isWarmingPrintPreview, isFalse);
+    vm.dispose();
+  });
+
+  test('FotoFlashbackFilterViewModel Fly 1-shot look taps skip print-twin warm',
+      () async {
+    SessionManager().setSessionFromResponse(_sessionJson('sess-look-tap-fly'));
+    final api = _StripFakeApi();
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+      theme: stripTheme,
+      imageDataUrls: [_tinyJpegDataUrl()],
+      apiService: api,
+      overlayCleanupBuildGate: false,
+    );
+    await vm.loadFilters();
+    final callsAfterLoad = api.composeCalls;
+    final other = vm.filters.firstWhere(
+      (f) => f.id != vm.selectedFilterId,
+      orElse: () => vm.filters.first,
+    );
+    vm.selectFilter(other.id);
+    if (vm.frames.length > 1) {
+      vm.selectFrame(vm.frames[1].id);
+    }
+    vm.addSticker('hearts');
+    await pumpEventQueue();
+    expect(vm.isWarmingPrintPreview, isFalse);
+    expect(api.composeCalls, callsAfterLoad);
+    vm.dispose();
+  });
+
+  test('FotoFlashbackFilterViewModel local compose reloads JPEGs from data URLs',
+      () async {
+    SessionManager().setSessionFromResponse(_sessionJson('sess-reload-jpeg'));
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: true,
+      theme: stripTheme,
+      imageDataUrls: [_tinyJpegDataUrl()],
+      overlayCleanupBuildGate: false,
+    );
+    await vm.loadFilters();
+    await pumpEventQueue();
+    vm.lookPreviewJpegBytesForTest = [];
+    final image = await vm.compose();
+    expect(image, isNotNull);
+    vm.dispose();
+  });
+
+  test('FotoFlashbackFilterViewModel local compose fails on undecodable shots',
+      () async {
+    SessionManager().setSessionFromResponse(_sessionJson('sess-bad-jpeg'));
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: true,
+      theme: stripTheme,
+      imageDataUrls: const ['data:image/jpeg;base64,@@@'],
+      overlayCleanupBuildGate: false,
+    );
+    await vm.loadFilters();
+    vm.lookPreviewJpegBytesForTest = [];
+    expect(await vm.compose(), isNull);
+    expect(vm.errorMessage, AppStrings.flashbackComposeFailed);
+    vm.dispose();
+  });
+
+  test('FotoFlashbackFilterViewModel local compose warm join times out',
+      () async {
+    SessionManager().setSessionFromResponse(_sessionJson('sess-local-warm-to'));
+    FotoFlashbackFilterViewModel.composeWarmJoinTimeoutForTest =
+        const Duration(milliseconds: 30);
+    final gate = Completer<void>();
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: true,
+      theme: stripTheme,
+      imageDataUrls: [_tinyJpegDataUrl()],
+      overlayCleanupBuildGate: false,
+    );
+    await vm.loadFilters();
+    vm.composeLocalStripSheetForTest = (_) async {
+      await gate.future;
+      return 'data:image/jpeg;base64,/9j/4AAQ';
+    };
+    unawaited(vm.refreshComposePreview());
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+    final composeFuture = vm.compose();
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    vm.composeLocalStripSheetForTest = null;
+    gate.complete();
+    final image = await composeFuture;
+    expect(image, isNotNull);
+    vm.dispose();
+  });
+
   test('FotoFlashbackFilterViewModel falls back when catalog has no filters',
       () async {
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
       apiService: _EmptyFiltersFakeApi(),
@@ -1031,6 +1716,7 @@ void main() {
   test('FotoFlashbackFilterViewModel catalog load timeout uses fallback', () {
     fakeAsync((async) {
       final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
         theme: stripTheme,
         imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
         apiService: _HangingCatalogFakeApi(),
@@ -1040,6 +1726,26 @@ void main() {
       async.flushMicrotasks();
       expect(vm.filters, isNotEmpty);
       expect(vm.errorMessage, AppStrings.flashbackFiltersLoadTimeout);
+      vm.dispose();
+    });
+  });
+
+  test('FotoFlashbackFilterViewModel catalog timeout stays silent offline', () {
+    fakeAsync((async) {
+      SessionManager().setSessionFromResponse(_sessionJson('sess-to-online'));
+      final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
+        theme: stripTheme,
+        imageDataUrls: List.filled(4, 'data:image/jpeg;base64,/9j/4AAQ'),
+        apiService: _HangingCatalogFakeApi(),
+      );
+      unawaited(vm.loadFilters());
+      async.flushMicrotasks();
+      SessionManager().markSessionOffline();
+      async.elapse(const Duration(seconds: 15));
+      async.flushMicrotasks();
+      expect(vm.filters, isNotEmpty);
+      expect(vm.errorMessage, isNull);
       vm.dispose();
     });
   });
@@ -1058,6 +1764,7 @@ void main() {
       }
       final api = _CountingScrubFakeApi();
       final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
         theme: stripTheme,
         imageDataUrls: List.filled(4, 'data:image/jpeg;base64,shot'),
         apiService: api,
@@ -1083,6 +1790,7 @@ void main() {
       SessionManager().setSessionFromResponse(_sessionJson('sess-prep-to'));
       final api = _HangingScrubComposeFakeApi();
       final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
         theme: stripTheme,
         imageDataUrls: List.filled(4, 'data:image/jpeg;base64,shot'),
         apiService: api,
@@ -1092,7 +1800,9 @@ void main() {
       );
       late GeneratedImage? image;
       unawaited(vm.compose().then((v) => image = v));
-      async.elapse(const Duration(seconds: 45));
+      async.elapse(
+        FotoFlashbackFilterViewModel.composePrepareJoinTimeoutForTest,
+      );
       async.flushMicrotasks();
       // After prepare timeout, composeStrip still runs (skipBake for 4-shot).
       async.elapse(const Duration(milliseconds: 10));
@@ -1108,8 +1818,9 @@ void main() {
       SessionManager().setSessionFromResponse(_sessionJson('sess-compose-to'));
       final api = _HangingComposeOnlyFakeApi();
       final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
         theme: stripTheme,
-        imageDataUrls: List.filled(4, 'data:image/jpeg;base64,shot'),
+        imageDataUrls: List.filled(4, 'data:image/jpeg;base64,@@@'),
         apiService: api,
         overlayCleanupAlreadyDone: true,
         overlayCleanupBuildGate: false,
@@ -1130,6 +1841,7 @@ void main() {
     final api = _StripFakeApi();
     final url = _tinyJpegDataUrl();
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: [url],
       apiService: api,
@@ -1174,6 +1886,7 @@ void main() {
     SessionManager().setSessionFromResponse(_sessionJson('sess-one-skip-prep'));
     final api = _HangingScrubComposeFakeApi();
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: [_tinyJpegDataUrl()],
       apiService: api,
@@ -1195,6 +1908,7 @@ void main() {
     final gate = Completer<void>();
     final api = _GatedComposeFakeApi(gate);
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: [_tinyJpegDataUrl()],
       apiService: api,
@@ -1221,6 +1935,7 @@ void main() {
     final gate = Completer<void>();
     final api = _GatedComposeFakeApi(gate);
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: [_tinyJpegDataUrl()],
       apiService: api,
@@ -1243,6 +1958,7 @@ void main() {
     SessionManager().setSessionFromResponse(_sessionJson('sess-orient-warm'));
     final api = _StripFakeApi();
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: [_tinyJpegDataUrl()],
       apiService: api,
@@ -1261,6 +1977,7 @@ void main() {
     SessionManager().setSessionFromResponse(_sessionJson('sess-start-warm'));
     final api = _StripFakeApi();
     final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: false,
       theme: stripTheme,
       imageDataUrls: [_tinyJpegDataUrl()],
       apiService: api,
@@ -1270,6 +1987,69 @@ void main() {
     final image = await vm.compose();
     expect(image, isNotNull);
     expect(api.composeCalls, greaterThan(0));
+    vm.dispose();
+  });
+
+  test('FotoFlashbackFilterViewModel compose uses cached jpeg bytes when available',
+      () async {
+    SessionManager().setSessionFromResponse(_sessionJson('sess-cached-bytes'));
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: true,
+      theme: stripTheme,
+      imageDataUrls: [_tinyJpegDataUrl()],
+      overlayCleanupBuildGate: false,
+    );
+    await vm.loadFilters();
+    vm.lookPreviewJpegBytesForTest = [kTinyJpegBytes];
+    final image = await vm.compose();
+    expect(image, isNotNull);
+    vm.dispose();
+  });
+
+  test('FotoFlashbackFilterViewModel compose shows error when local sheet fails',
+      () async {
+    SessionManager().setSessionFromResponse(_sessionJson('sess-sheet-fail'));
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: true,
+      theme: stripTheme,
+      imageDataUrls: [_tinyJpegDataUrl()],
+      overlayCleanupBuildGate: false,
+    );
+    await vm.loadFilters();
+    vm.composeLocalStripSheetForTest = (_) async => null;
+    final image = await vm.compose();
+    expect(image, isNull);
+    expect(vm.errorMessage, AppStrings.flashbackComposeFailed);
+    vm.dispose();
+  });
+
+  test('FotoFlashbackFilterViewModel compose restarts warm after filter change',
+      () async {
+    SessionManager().setSessionFromResponse(_sessionJson('sess-fp-miss'));
+    final gate = Completer<void>();
+    final vm = FotoFlashbackFilterViewModel(
+      eventPrintIsLocal: true,
+      theme: stripTheme,
+      imageDataUrls: [_tinyJpegDataUrl()],
+      overlayCleanupBuildGate: false,
+    );
+    await vm.loadFilters();
+    // Block the local compose so the warm stays in flight.
+    vm.composeLocalStripSheetForTest = (_) async {
+      await gate.future;
+      return 'data:image/jpeg;base64,/9j/4AAQ';
+    };
+    unawaited(vm.refreshComposePreview());
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+    // Change filter → fingerprint changes; warm is still in flight.
+    if (vm.filters.length > 1) {
+      vm.selectFilter(vm.filters[1].id);
+    }
+    // Let compose run without the blocking override.
+    vm.composeLocalStripSheetForTest = null;
+    gate.complete();
+    final image = await vm.compose();
+    expect(image, isNotNull);
     vm.dispose();
   });
 }
@@ -1356,16 +2136,24 @@ class _ThrowingScrubFakeApi extends _StripFakeApi {
 class _StripFakeApi extends FakeApiService {
   _StripFakeApi({
     this.failCompose = false,
+    this.failComposeWan = false,
+    this.failCompose400 = false,
     this.failLoad = false,
+    this.failLoadHostLookup = false,
     this.throwGenericLoad = false,
     this.throwGenericCompose = false,
     this.monoOnly = false,
     this.altChromeOnly = false,
     this.enableOsdScrub = true,
+    super.kioskFrames,
+    super.framesThrow,
   });
 
   final bool failCompose;
+  final bool failComposeWan;
+  final bool failCompose400;
   final bool failLoad;
+  final bool failLoadHostLookup;
   final bool throwGenericLoad;
   final bool throwGenericCompose;
   final bool monoOnly;
@@ -1383,6 +2171,12 @@ class _StripFakeApi extends FakeApiService {
 
   @override
   Future<StripFiltersCatalog> fetchStripFilters() async {
+    if (failLoadHostLookup) {
+      throw ApiException(
+        "Failed to load strip filters: The connection errored: "
+        "Failed host lookup: 'zenai.fly.dev'",
+      );
+    }
     if (failLoad) throw ApiException('filters down');
     if (throwGenericLoad) throw Exception('load boom');
     if (altChromeOnly) {
@@ -1504,6 +2298,12 @@ class _StripFakeApi extends FakeApiService {
     lastComposeTimeout = timeout;
     if (failCompose) {
       throw ApiException('compose down');
+    }
+    if (failCompose400) {
+      throw ApiException('Select a FotoFlashback theme before composing', 400);
+    }
+    if (failComposeWan) {
+      throw ApiException(AppConstants.kErrorNetwork, 503);
     }
     if (throwGenericCompose) {
       throw Exception('compose boom');
@@ -1640,6 +2440,61 @@ class _SheetFramesFakeApi extends _StripFakeApi {
   }
 }
 
+class _TemplateFramesFakeApi extends _StripFakeApi {
+  @override
+  Future<StripFiltersCatalog> fetchStripFilters() async {
+    return StripFiltersCatalog.fromJson({
+      'brand': 'FotoFlashback',
+      'shotCount': 4,
+      'filters': [
+        {
+          'id': 'classic_warm',
+          'name': 'Classic Warm',
+          'description': 'Warm',
+          'cssFilter': 'none',
+        },
+      ],
+      'frames': [
+        {'id': 'classic', 'name': 'Classic', 'description': 'White'},
+        {
+          'id': 'st:tpl-1',
+          'name': 'Date night',
+          'description': 'Scrapbook',
+          'kind': 'template',
+          'overlayUrl': 'https://example.com/st.png',
+        },
+        {
+          'id': 'fr:frame-1',
+          'name': 'DPS 6×2',
+          'description': 'Occasion strip',
+          'kind': 'template',
+          'overlayUrl': 'https://example.com/fr.png',
+          'shotCount': 4,
+        },
+        {
+          'id': 'f3:frame-1',
+          'name': 'DPS 3-shot 6×2',
+          'description': 'Occasion 3-shot strip',
+          'kind': 'template',
+          'overlayUrl': 'https://example.com/f3.png',
+          'shotCount': 3,
+        },
+        {
+          'id': 'ai:frame-1',
+          'name': 'DPS',
+          'description': 'AI overlay',
+          'kind': 'occasion',
+          'overlayUrl': 'https://example.com/ai.png',
+          'shotCount': 1,
+        },
+      ],
+      'stickers': [
+        {'id': 'none', 'name': 'None', 'description': 'None'},
+      ],
+    });
+  }
+}
+
 class _EmptyFiltersFakeApi extends _StripFakeApi {
   @override
   Future<StripFiltersCatalog> fetchStripFilters() async {
@@ -1648,6 +2503,15 @@ class _EmptyFiltersFakeApi extends _StripFakeApi {
       'shotCount': 4,
       'filters': <Map<String, dynamic>>[],
     });
+  }
+}
+
+class _ThrowingCachedFramesApi extends _StripFakeApi {
+  _ThrowingCachedFramesApi() : super(failLoad: true);
+
+  @override
+  Future<List<KioskFrameModel>> getCachedKioskFrames() async {
+    throw Exception('disk boom');
   }
 }
 

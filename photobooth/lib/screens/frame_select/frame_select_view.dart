@@ -7,13 +7,14 @@ import '../photo_capture/photo_model.dart';
 import '../theme_selection/theme_model.dart';
 import '../../models/kiosk_frame_model.dart';
 import '../../services/app_settings_manager.dart';
+import '../../services/session_manager.dart';
 import '../../utils/payment_workflow_helpers.dart';
 import '../../utils/route_args.dart';
 import '../../utils/secure_image_url.dart';
 import '../../views/widgets/app_snackbar.dart';
 import '../../views/widgets/cached_network_image.dart';
+import '../../services/image_cache_source.dart';
 import '../../views/widgets/centered_max_width.dart';
-import '../../views/widgets/leading_with_alice.dart' show AppBarAliceAction;
 import '../../views/widgets/theme_background.dart';
 import '../photo_capture/photo_image_from_xfile_io.dart'
     if (dart.library.html) '../photo_capture/photo_image_from_xfile_web.dart' as photo_image;
@@ -102,6 +103,7 @@ class _FrameSelectScreenState extends State<FrameSelectScreen> {
             .read<AppSettingsManager>()
             .settings
             ?.paymentCollectionTiming,
+        wanDown: SessionManager().isOfflineSession,
       ),
     );
   }
@@ -209,7 +211,6 @@ class _FrameSelectScreenState extends State<FrameSelectScreen> {
                     ? null
                     : () => Navigator.of(context).maybePop(),
               ),
-              actions: const [AppBarAliceAction()],
             ),
             body: Stack(
               children: [
@@ -425,6 +426,7 @@ class _FrameTile extends StatelessWidget {
                       ),
                       CachedNetworkImage(
                         imageUrl: overlayUrl,
+                        cacheKey: catalogCacheKeyForFrame(frame.id),
                         fit: BoxFit.contain,
                         filterQuality: FilterQuality.medium,
                         placeholder: const ColoredBox(color: Colors.transparent),

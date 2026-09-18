@@ -1,16 +1,17 @@
 import 'dart:convert';
 import 'dart:math' as math;
-import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../models/strip_models.dart';
+import 'fotoflashback_look_picker_layout.dart';
 
 /// On-screen 4×6 preview for Classic sheet layouts (polaroid / grid / romantic).
 ///
 /// Geometry comes from zenai `STRIP_WYSIWYG_LAYOUT`. When [colorFilter] is null,
 /// [imageDataUrls] are assumed already Sharp-graded (Option A).
-class FotoFlashbackSheetLayoutPreview extends StatelessWidget {
+class FotoFlashbackSheetLayoutPreview extends StatefulWidget {
   const FotoFlashbackSheetLayoutPreview({
     super.key,
     required this.imageDataUrls,
@@ -19,9 +20,11 @@ class FotoFlashbackSheetLayoutPreview extends StatelessWidget {
     required this.height,
     this.colorFilter,
     this.layout,
+    this.imageJpegBytes = const [],
   });
 
   final List<String> imageDataUrls;
+  final List<Uint8List> imageJpegBytes;
   final ColorFilter? colorFilter;
   final String layoutId;
   final StripWysiwygLayout? layout;
@@ -29,42 +32,82 @@ class FotoFlashbackSheetLayoutPreview extends StatelessWidget {
   final double height;
 
   @override
+  State<FotoFlashbackSheetLayoutPreview> createState() =>
+      _FotoFlashbackSheetLayoutPreviewState();
+}
+
+class _FotoFlashbackSheetLayoutPreviewState
+    extends State<FotoFlashbackSheetLayoutPreview> {
+  List<Uint8List> _images = const [];
+  List<String> _decodedUrls = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    _decodeIfNeeded(force: true);
+  }
+
+  @override
+  void didUpdateWidget(covariant FotoFlashbackSheetLayoutPreview oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _decodeIfNeeded(force: false);
+  }
+
+  void _decodeIfNeeded({required bool force}) {
+    if (widget.imageJpegBytes.isNotEmpty) {
+      if (!force && _sameJpegBytes(widget.imageJpegBytes)) return;
+      _decodedUrls = const [];
+      _images = widget.imageJpegBytes.take(kStripShotCount).toList();
+      return;
+    }
+    final urls = widget.imageDataUrls.take(kStripShotCount).toList();
+    if (!force && listEquals(urls, _decodedUrls)) return;
+    _decodedUrls = urls;
+    _images = urls.map(_bytesFromDataUrl).toList();
+  }
+
+  bool _sameJpegBytes(List<Uint8List> next) {
+    if (_images.length != next.length) return false;
+    for (var i = 0; i < _images.length; i++) {
+      if (!identical(_images[i], next[i])) return false;
+    }
+    return true;
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final wysiwyg = layout ?? StripWysiwygLayout.defaults;
-    final images =
-        imageDataUrls.take(kStripShotCount).map(_bytesFromDataUrl).toList();
-    final body = switch (layoutId) {
+    final wysiwyg = widget.layout ?? StripWysiwygLayout.defaults;
+    final body = switch (widget.layoutId) {
       'polaroid' => _PolaroidSheetPreview(
-          images: images,
+          images: _images,
           layout: wysiwyg,
-          colorFilter: colorFilter,
+          colorFilter: widget.colorFilter,
         ),
       'romantic' => _RomanticSheetPreview(
-          images: images,
+          images: _images,
           layout: wysiwyg,
-          colorFilter: colorFilter,
+          colorFilter: widget.colorFilter,
         ),
       _ => _Grid2x2SheetPreview(
-          images: images,
+          images: _images,
           layout: wysiwyg,
-          colorFilter: colorFilter,
+          colorFilter: widget.colorFilter,
         ),
     };
 
     return SizedBox(
-      key: ValueKey<String>('sheet_layout_$layoutId'),
-      width: width,
-      height: height,
+      width: widget.width,
+      height: widget.height,
       child: Stack(
         fit: StackFit.expand,
         children: [
-          // Grade photos only — chrome/copy stay unfiltered (matches print).
           body,
           Positioned(
+            key: ValueKey<String>('sheet_layout_${widget.layoutId}'),
             left: 0,
             right: 0,
             bottom: 0,
-            child: _SheetCredentialBar(layout: wysiwyg, sheetWidth: width),
+            child: _SheetCredentialBar(layout: wysiwyg, sheetWidth: widget.width),
           ),
         ],
       ),
@@ -113,6 +156,7 @@ class _SheetCredentialBar extends StatelessWidget {
 Widget _gradedPhoto({
   required Uint8List? bytes,
   required ColorFilter? colorFilter,
+  required int cacheWidth,
   BoxFit fit = BoxFit.cover,
 }) {
   if (bytes == null) return const ColoredBox(color: Colors.black12);
@@ -122,10 +166,18 @@ Widget _gradedPhoto({
     width: double.infinity,
     height: double.infinity,
     gaplessPlayback: true,
-    filterQuality: FilterQuality.high,
+    filterQuality: kFlashbackLookPreviewFilterQuality,
+    cacheWidth: cacheWidth,
   );
   if (colorFilter == null) return image;
   return ColorFiltered(colorFilter: colorFilter, child: image);
+}
+
+int _sheetPhotoCacheWidth(BuildContext context, double layoutWidth) {
+  return flashbackLookPreviewCacheWidth(
+    layoutWidth: layoutWidth,
+    devicePixelRatio: MediaQuery.devicePixelRatioOf(context),
+  );
 }
 
 class _PolaroidSheetPreview extends StatelessWidget {
@@ -196,7 +248,11 @@ class _PolaroidCell extends StatelessWidget {
       height: height,
       padding: EdgeInsets.fromLTRB(pad, pad, pad, caption),
       color: const Color(0xFFFFFCF8),
-      child: _gradedPhoto(bytes: bytes, colorFilter: colorFilter),
+      child: _gradedPhoto(
+        bytes: bytes,
+        colorFilter: colorFilter,
+        cacheWidth: _sheetPhotoCacheWidth(context, width),
+      ),
     );
   }
 }
@@ -233,6 +289,7 @@ class _Grid2x2SheetPreview extends StatelessWidget {
             child: _gradedPhoto(
               bytes: images.length > i ? images[i] : null,
               colorFilter: colorFilter,
+              cacheWidth: _sheetPhotoCacheWidth(context, cellW),
               fit: BoxFit.contain,
             ),
           );
@@ -338,6 +395,7 @@ class _RomanticSheetPreview extends StatelessWidget {
             child: _gradedPhoto(
               bytes: images.length > i ? images[i] : null,
               colorFilter: colorFilter,
+              cacheWidth: _sheetPhotoCacheWidth(context, w * slot.width),
               fit: BoxFit.contain,
             ),
           );

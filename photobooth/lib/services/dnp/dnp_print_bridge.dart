@@ -173,8 +173,25 @@ class DnpPrintBridge {
     } on PlatformException catch (e) {
       if (!_isRecoverableUsbError(e)) rethrow;
       AppLogger.warning(
-        'DNP USB print unavailable (${e.code}); continuing hunt',
+        'DNP USB print unavailable (${e.code}): ${e.message ?? "no detail"}; '
+        'continuing hunt for a network printer',
       );
+      // A denied grant is the one recoverable code an operator can act on, and it
+      // is invisible when the hunt then finds no network printer and the button
+      // appears to do nothing.
+      //
+      // Passed with [error] deliberately: AppLogger.error only forwards to Bugsnag
+      // when an error object is present, and a booth in the field is the one place
+      // logcat cannot be read. The other recoverable codes stay local — a powered
+      // off printer is routine and would only add noise.
+      if (e.code == 'PERMISSION_DENIED') {
+        AppLogger.error(
+          'DNP USB permission was refused. Printing will only work over the '
+          'network until the printer is replugged and USB access allowed.',
+          error: e,
+          stackTrace: StackTrace.current,
+        );
+      }
       _usbReady = false;
       return false;
     }
@@ -191,10 +208,10 @@ class DnpPrintBridge {
       _usbReady = true;
     }
     try {
-      await _usb.print(
+      await _sendUsbPrintJobs(
         filePath: filePath,
-        paperSize: size.usbLabel,
-        printSize: networkPrintSize,
+        size: size,
+        networkPrintSize: networkPrintSize,
         copies: copies,
       );
     } on PlatformException catch (e) {
@@ -206,11 +223,30 @@ class DnpPrintBridge {
       _usbReady = false;
       await _usb.ensureConnected();
       _usbReady = true;
+      await _sendUsbPrintJobs(
+        filePath: filePath,
+        size: size,
+        networkPrintSize: networkPrintSize,
+        copies: copies,
+      );
+    }
+  }
+
+  /// 2-inch cutter jobs ignore CNTRL QTY — send one USB job per copy.
+  Future<void> _sendUsbPrintJobs({
+    required String filePath,
+    required DnpPrintSize size,
+    required String networkPrintSize,
+    required int copies,
+  }) async {
+    final jobs = dnpUsbCopyJobCount(networkPrintSize, copies);
+    final perJob = jobs > 1 ? 1 : copies;
+    for (var i = 0; i < jobs; i++) {
       await _usb.print(
         filePath: filePath,
         paperSize: size.usbLabel,
         printSize: networkPrintSize,
-        copies: copies,
+        copies: perJob,
       );
     }
   }

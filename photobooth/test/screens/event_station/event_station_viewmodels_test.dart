@@ -10,6 +10,7 @@ import 'package:photobooth/screens/event_station/event_theme_station_viewmodel.d
 import 'package:photobooth/screens/theme_selection/theme_model.dart';
 import 'package:photobooth/services/api_service.dart';
 import 'package:photobooth/services/event_station_api.dart';
+import 'package:photobooth/utils/event_station_timing.dart';
 import 'package:photobooth/utils/exceptions.dart';
 import 'package:dio/dio.dart';
 
@@ -20,27 +21,40 @@ class _FakeStationApi extends EventStationApi {
   List<EventThemeStationJob> themeJobs = const [];
   List<EventPrintStationJob> printJobs = const [];
   EventStationStats stats = const EventStationStats();
+  EventDeliveryStats delivery = const EventDeliveryStats();
   Object? themeClaimError;
   Object? themeCompleteError;
   Object? printClaimError;
   Object? printCompleteError;
   Object? reissueError;
+  Object? skipError;
+  Object? retryError;
+  String? skippedJobId;
+  String? retriedJobId;
   Object? listError;
   String? completedThemeId;
   String? reissuedJobId;
   bool? lastPrintSuccess;
 
   Completer<void>? claimHold;
+  bool reuseBoard = false;
+  EventStationBoard? _stableBoard;
 
   @override
   Future<EventStationBoard> fetchBoard() async {
     if (listError != null) throw listError!;
-    return EventStationBoard(
+    final board = EventStationBoard(
       stats: stats,
+      delivery: delivery,
       captures: captures,
       themeJobs: themeJobs,
       printJobs: printJobs,
     );
+    if (reuseBoard) {
+      _stableBoard ??= board;
+      return _stableBoard!;
+    }
+    return board;
   }
 
   @override
@@ -60,6 +74,18 @@ class _FakeStationApi extends EventStationApi {
   Future<void> completeThemeJob({required String jobId, required String themeId}) async {
     if (themeCompleteError != null) throw themeCompleteError!;
     completedThemeId = themeId;
+  }
+
+  @override
+  Future<void> skipThemeJob(String jobId) async {
+    if (skipError != null) throw skipError!;
+    skippedJobId = jobId;
+  }
+
+  @override
+  Future<void> retryThemeJob(String jobId) async {
+    if (retryError != null) throw retryError!;
+    retriedJobId = jobId;
   }
 
   @override
@@ -129,7 +155,12 @@ void main() {
           previewUrls: ['https://cdn/a.jpg', 'https://cdn/b.jpg'],
         ),
       ]
-      ..stats = const EventStationStats(captures: 1, themePending: 1);
+      ..stats = const EventStationStats(captures: 1, themePending: 1)
+      ..delivery = const EventDeliveryStats(
+        guestsRegistered: 4,
+        processed: 2,
+        digitalSent: 1,
+      );
     final vm = EventCaptureStationViewModel(
       stationApi: api,
       pollInterval: const Duration(hours: 1),
@@ -138,10 +169,17 @@ void main() {
     await Future<void>.delayed(Duration.zero);
     expect(vm.carouselUrls, ['https://cdn/a.jpg', 'https://cdn/b.jpg']);
     expect(vm.stats.captures, 1);
+    expect(vm.delivery.guestsRegistered, 4);
+    expect(vm.delivery.processed, 2);
+    expect(vm.delivery.digitalSent, 1);
     expect(vm.captures, hasLength(1));
-    expect(vm.statusFilter, 'PENDING');
+    expect(vm.statusFilter, 'ALL');
+    expect(vm.filteredCaptures, hasLength(1));
     vm.setStatusFilter('DONE');
     expect(vm.filteredCaptures, isEmpty);
+    api.reuseBoard = true;
+    await vm.refreshBoard();
+    await vm.refreshBoard();
     api.listError = ApiException('down');
     await vm.refreshBoard();
     expect(vm.errorMessage, 'down');
@@ -166,7 +204,51 @@ void main() {
     vm.selectTheme('t2');
     expect(await vm.completeSelected(), isTrue);
     expect(api.completedThemeId, 't2');
-    expect(vm.claimed, isNull);
+    vm.dispose();
+  });
+
+  test('theme station skip and retry jobs', () async {
+    final failed = EventThemeStationJob(
+      id: 'jf',
+      sessionId: 's1',
+      status: 'PENDING',
+      times: const EventStationJobTimes(rawStatus: 'FAILED'),
+    );
+    final api = _FakeStationApi()..themeJobs = [waiting, failed];
+    final vm = EventThemeStationViewModel(
+      api: api,
+      loadThemes: () async => [_theme('t1')],
+      pollInterval: const Duration(hours: 1),
+    );
+    await vm.refreshQueue();
+    expect(await vm.skipJob('j1'), isTrue);
+    expect(api.skippedJobId, 'j1');
+
+    expect(await vm.claimJob('j1'), isTrue);
+    expect(vm.hasClaimedJob, isTrue);
+    expect(await vm.skipJob('j1'), isTrue);
+    expect(vm.hasClaimedJob, isFalse);
+    expect(await vm.retryJob('jf'), isTrue);
+    expect(api.retriedJobId, 'jf');
+    expect(vm.statusFilter, 'PENDING');
+
+    api.skipError = ApiException('no-drop');
+    expect(await vm.skipJob('j1'), isFalse);
+    expect(vm.errorMessage, 'no-drop');
+    api.skipError = StateError('skip-boom');
+    expect(await vm.skipJob('j1'), isFalse);
+    api.skipError = null;
+    api.retryError = ApiException('no-retry');
+    expect(await vm.retryJob('jf'), isFalse);
+    api.retryError = StateError('retry-boom');
+    expect(await vm.retryJob('jf'), isFalse);
+    api.retryError = null;
+    api.claimHold = Completer<void>();
+    final held = vm.claimJob('j1');
+    expect(await vm.skipJob('j1'), isFalse);
+    expect(await vm.retryJob('jf'), isFalse);
+    api.claimHold!.complete();
+    await held;
     vm.dispose();
   });
 
@@ -391,10 +473,13 @@ void main() {
     );
     printVm.startPolling();
     await Future<void>.delayed(const Duration(milliseconds: 20));
+    printApi.reuseBoard = true;
+    await printVm.refreshQueue();
     printVm.setStatusFilter('DONE');
     expect(printVm.filteredJobs, isEmpty);
     printVm.setStatusFilter('PENDING');
     expect(printVm.stats.printPending, 1);
+    expect(printVm.delivery.digitalSent, 0);
     expect(printVm.statusFilter, 'PENDING');
     expect(printVm.filteredJobs, hasLength(1));
     expect(printVm.active, isNull);
@@ -433,8 +518,11 @@ void main() {
       pollInterval: const Duration(milliseconds: 5),
     );
     await themeVm.refreshQueue();
+    themeApi.reuseBoard = true;
+    await themeVm.refreshQueue();
     await themeVm.claimNext();
     expect(themeVm.stats.captures, 0);
+    expect(themeVm.delivery.guestsRegistered, 0);
     expect(themeVm.statusFilter, 'PENDING');
     expect(themeVm.looks, isNotEmpty);
     themeVm.startPolling();

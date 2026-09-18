@@ -1,11 +1,17 @@
 // Named-route table for MaterialApp (extracted from main for Sonar complexity).
 import 'package:flutter/material.dart';
 
+import 'screens/event_pipeline/event_ingest_view.dart';
+import 'screens/event_pipeline/event_hub_view.dart';
+import 'screens/event_pipeline/event_item_detail_view.dart';
+import 'screens/event_pipeline/event_settings_view.dart';
+import 'screens/event_pipeline/event_queue_view.dart';
 import 'screens/event_station/event_capture_station_view.dart';
 import 'screens/event_station/event_print_station_view.dart';
 import 'screens/event_station/event_station_picker_view.dart';
 import 'screens/event_station/event_theme_station_view.dart';
 import 'screens/print_selection/print_selection_view.dart';
+import 'screens/classic_shot_choice/classic_shot_choice_view.dart';
 import 'screens/experience_choice/experience_choice_view.dart';
 import 'screens/frame_select/frame_select_view.dart';
 import 'screens/fotoflashback/fotoflashback_capture_view.dart';
@@ -48,6 +54,10 @@ Map<String, WidgetBuilder> buildAppRoutes() {
     },
     AppConstants.kRouteExperienceChoice: (context) =>
         const ExperienceChoiceScreen(),
+    AppConstants.kRouteClassicShotChoice: (context) {
+      final raw = ModalRoute.of(context)?.settings.arguments;
+      return ClassicShotChoiceScreen.fromRouteArgs(raw);
+    },
     AppConstants.kRouteHome: (context) => const ThemeSelectionScreen(),
     AppConstants.kRouteCapture: (context) {
       final raw = ModalRoute.of(context)?.settings.arguments;
@@ -84,6 +94,19 @@ Map<String, WidgetBuilder> buildAppRoutes() {
         const EventThemeStationScreen(),
     AppConstants.kRouteEventPrintStation: (context) =>
         const EventPrintStationScreen(),
+    AppConstants.kRouteEventIngestStation: (context) =>
+        const EventIngestScreen(),
+    AppConstants.kRouteEventHub: (context) => const EventHubScreen(),
+    AppConstants.kRouteEventSettings: (context) => const EventSettingsScreen(),
+    AppConstants.kRouteEventItemDetail: (context) => EventItemDetailScreen(
+          mediaId:
+              (ModalRoute.of(context)?.settings.arguments as String?) ?? '',
+        ),
+    AppConstants.kRouteEventQueue: (context) => EventQueueScreen(
+          // The hub's counters open the queue already filtered to the stage
+          // that was tapped.
+          initialFilter: ModalRoute.of(context)?.settings.arguments as String?,
+        ),
     AppConstants.kRouteWebView: (context) => WebViewScreen.fromRouteSettings(
           ModalRoute.of(context)?.settings,
         ),

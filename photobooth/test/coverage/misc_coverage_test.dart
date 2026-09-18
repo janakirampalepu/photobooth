@@ -58,13 +58,51 @@ void main() {
 
   test('AppRuntimeConfig applyFromSettings toggles', () {
     AppRuntimeConfig.instance.applyFromSettings(
-      AppSettingsModel(showGenerationCommentary: false),
+      AppSettingsModel(showGenerationCommentary: false, showApiLogs: false),
     );
+    expect(AppRuntimeConfig.instance.showApiLogs, isFalse);
     AppRuntimeConfig.instance.applyFromSettings(
       AppSettingsModel(showGenerationCommentary: true),
     );
     expect(AppRuntimeConfig.instance.showGenerationCommentary, isTrue);
+    expect(AppRuntimeConfig.instance.showApiLogs, isTrue);
     applyFlutterImageCacheLimits();
+  });
+
+  test('AppRuntimeConfig showApiLogs defaults on and follows settings', () {
+    AppRuntimeConfig.instance.applyFromSettings(null);
+    expect(AppRuntimeConfig.instance.showApiLogs, isTrue);
+    AppRuntimeConfig.instance.applyFromSettings(
+      AppSettingsModel(showApiLogs: false),
+    );
+    expect(AppRuntimeConfig.instance.showApiLogs, isFalse);
+    AppRuntimeConfig.instance.applyFromSettings(
+      AppSettingsModel(showApiLogs: false),
+    );
+    expect(AppRuntimeConfig.instance.showApiLogs, isFalse);
+    AppRuntimeConfig.instance.applyFromSettings(AppSettingsModel.fromJson({}));
+    expect(AppRuntimeConfig.instance.showApiLogs, isTrue);
+  });
+
+  test('AppRuntimeConfig Classic pose countdown from settings and bind', () {
+    AppRuntimeConfig.instance.applyFromSettings(null);
+    expect(AppRuntimeConfig.instance.classicPoseCountdownSeconds, 10);
+    AppRuntimeConfig.instance.applyClassicPoseCountdown(7);
+    expect(AppRuntimeConfig.instance.classicPoseCountdownSeconds, 7);
+    AppRuntimeConfig.instance.applyClassicPoseCountdown(7);
+    expect(AppRuntimeConfig.instance.classicPoseCountdownSeconds, 7);
+    AppRuntimeConfig.instance.applyFromSettings(AppSettingsModel());
+    expect(AppRuntimeConfig.instance.classicPoseCountdownSeconds, 7);
+    AppRuntimeConfig.instance.applyFromSettings(
+      AppSettingsModel(classicPoseCountdownSeconds: 12),
+    );
+    expect(AppRuntimeConfig.instance.classicPoseCountdownSeconds, 12);
+    AppRuntimeConfig.instance.applyClassicPoseCountdown(3);
+    expect(AppRuntimeConfig.instance.classicPoseCountdownSeconds, 5);
+    AppRuntimeConfig.instance.applyClassicPoseCountdown(20);
+    expect(AppRuntimeConfig.instance.classicPoseCountdownSeconds, 15);
+    AppRuntimeConfig.instance.applyFromSettings(null);
+    expect(AppRuntimeConfig.instance.classicPoseCountdownSeconds, 10);
   });
 
   test('KioskManager prefs round-trip', () async {
@@ -168,6 +206,10 @@ void main() {
   test('ImageHelper encodeImageToBase64 and rotate', () async {
     final url = await ImageHelper.encodeImageToBase64(tinyJpegXFile());
     expect(url, startsWith('data:image/jpeg'));
+    final fromBytes = await ImageHelper.encodeBytesToBase64DataUrl(
+      kTinyJpegBytes,
+    );
+    expect(fromBytes, startsWith('data:image/jpeg;base64,'));
   });
 
   test('secure_image_url and theme urls', () {
@@ -202,6 +244,22 @@ void main() {
     AppLogger.info('i');
     AppLogger.warning('w');
     AppLogger.error('e', error: Exception('x'));
+  });
+
+  test('AppLogger console mirror can be silenced', () {
+    // The mirror is what makes Dart logs visible in logcat; the flag exists so a
+    // test run does not have to carry them.
+    // Restore whatever flutter_test_config set, not a hardcoded true.
+    final previous = AppLogger.mirrorLogsToConsole;
+    addTearDown(() => AppLogger.mirrorLogsToConsole = previous);
+
+    AppLogger.mirrorLogsToConsole = false;
+    AppLogger.info('silenced');
+    AppLogger.error('silenced', error: Exception('x'), stackTrace: StackTrace.current);
+
+    AppLogger.mirrorLogsToConsole = true;
+    AppLogger.info('mirrored');
+    AppLogger.error('mirrored', error: Exception('x'), stackTrace: StackTrace.current);
   });
 
   test('ErrorReportingManager with fake service', () async {

@@ -17,6 +17,8 @@ class QrShareScaffoldBody extends StatelessWidget {
     required this.waLine,
     required this.secondsLeftListenable,
     required this.onExit,
+    this.offline = false,
+    this.appBarTitle,
   });
 
   final String qrData;
@@ -26,102 +28,147 @@ class QrShareScaffoldBody extends StatelessWidget {
   final String waLine;
   final ValueListenable<int> secondsLeftListenable;
   final VoidCallback onExit;
+  final bool offline;
+  final String? appBarTitle;
 
   @override
   Widget build(BuildContext context) {
-    final canShowQr = qrData.isNotEmpty;
     return Scaffold(
       backgroundColor: Colors.transparent,
-      extendBodyBehindAppBar: true,
-      appBar: AppBar(
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        scrolledUnderElevation: 0,
-        surfaceTintColor: Colors.transparent,
-        forceMaterialTransparency: true,
-        leading: IconButton(
-          icon: const Icon(CupertinoIcons.xmark, color: Colors.white),
-          onPressed: onExit,
-        ),
-        title: const Text(
-          'SCAN & SHARE',
-          style: TextStyle(
-            color: Colors.white,
-            fontWeight: FontWeight.w700,
-          ),
-        ),
-        centerTitle: true,
-      ),
       body: Stack(
         children: [
           const Positioned.fill(child: _QrShareStaticBackground()),
           SafeArea(
-            child: Center(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 18),
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 520),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        canShowQr ? headline : 'Preparing your share link…',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          fontSize: 14,
-                          height: 1.35,
-                          color: Colors.white.withValues(alpha: 0.88),
-                          fontWeight: FontWeight.w600,
-                        ),
+            child: Column(
+              children: [
+                _QrShareTopBar(
+                  title: appBarTitle ?? 'SCAN & SHARE',
+                  onClose: onExit,
+                ),
+                Expanded(
+                  child: Center(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 18),
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 520),
+                        child: _QrShareScrollContent(screen: this),
                       ),
-                      if (expiry.isNotEmpty) ...[
-                        const SizedBox(height: 6),
-                        Text(
-                          expiry,
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                            fontSize: 12,
-                            height: 1.25,
-                            color: Colors.white.withValues(alpha: 0.78),
-                          ),
-                        ),
-                      ],
-                      if (waLine.isNotEmpty) ...[
-                        const SizedBox(height: 8),
-                        Text(
-                          waLine,
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                            fontSize: 12,
-                            height: 1.25,
-                            color: Colors.white.withValues(alpha: 0.78),
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ],
-                      const SizedBox(height: 14),
-                      _QrShareCodeBox(canShowQr: canShowQr, qrData: qrData),
-                      if (longUrl.isNotEmpty) ...[
-                        const SizedBox(height: 12),
-                        SelectableText(
-                          longUrl,
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                            fontSize: 12,
-                            height: 1.25,
-                            color: Colors.white.withValues(alpha: 0.8),
-                          ),
-                        ),
-                      ],
-                      const SizedBox(height: 18),
-                      _QrShareFooter(
-                        secondsLeftListenable: secondsLeftListenable,
-                        onStartAgain: onExit,
-                      ),
-                    ],
+                    ),
                   ),
                 ),
-              ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _QrShareScrollContent extends StatelessWidget {
+  const _QrShareScrollContent({required this.screen});
+
+  final QrShareScaffoldBody screen;
+
+  @override
+  Widget build(BuildContext context) {
+    final canShowQr = screen.qrData.isNotEmpty;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          canShowQr || screen.offline
+              ? screen.headline
+              : AppStrings.qrSharePreparingShareLink,
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            fontSize: 14,
+            height: 1.35,
+            color: Colors.white.withValues(alpha: 0.88),
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        if (screen.expiry.isNotEmpty) ...[
+          const SizedBox(height: 6),
+          Text(
+            screen.expiry,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 12,
+              height: 1.25,
+              color: Colors.white.withValues(alpha: 0.78),
+            ),
+          ),
+        ],
+        if (screen.waLine.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Text(
+            screen.waLine,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 12,
+              height: 1.25,
+              color: Colors.white.withValues(alpha: 0.78),
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+        const SizedBox(height: 14),
+        _QrShareCodeBox(
+          canShowQr: canShowQr,
+          qrData: screen.qrData,
+          offline: screen.offline,
+        ),
+        if (screen.longUrl.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          SelectableText(
+            screen.longUrl,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 12,
+              height: 1.25,
+              color: Colors.white.withValues(alpha: 0.8),
+            ),
+          ),
+        ],
+        const SizedBox(height: 18),
+        _QrShareFooter(
+          secondsLeftListenable: screen.secondsLeftListenable,
+          onStartAgain: screen.onExit,
+        ),
+      ],
+    );
+  }
+}
+
+class _QrShareTopBar extends StatelessWidget {
+  const _QrShareTopBar({
+    required this.title,
+    required this.onClose,
+  });
+
+  final String title;
+  final VoidCallback onClose;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 48,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: IconButton(
+              icon: const Icon(CupertinoIcons.xmark, color: Colors.white),
+              onPressed: onClose,
             ),
           ),
         ],
@@ -131,10 +178,15 @@ class QrShareScaffoldBody extends StatelessWidget {
 }
 
 class _QrShareCodeBox extends StatelessWidget {
-  const _QrShareCodeBox({required this.canShowQr, required this.qrData});
+  const _QrShareCodeBox({
+    required this.canShowQr,
+    required this.qrData,
+    this.offline = false,
+  });
 
   final bool canShowQr;
   final String qrData;
+  final bool offline;
 
   @override
   Widget build(BuildContext context) {
@@ -172,8 +224,14 @@ class _QrShareCodeBox extends StatelessWidget {
                 ),
               ),
             )
-          : const Center(
-              child: CircularProgressIndicator(strokeWidth: 2),
+          : Center(
+              child: offline
+                  ? Icon(
+                      Icons.print_outlined,
+                      size: 72,
+                      color: Colors.grey.shade500,
+                    )
+                  : const CircularProgressIndicator(strokeWidth: 2),
             ),
     );
   }

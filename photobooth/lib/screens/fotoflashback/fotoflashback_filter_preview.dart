@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 
 import '../../models/strip_models.dart';
+import '../../utils/classic_offline_frames.dart';
 import '../../utils/strip_look_color_matrices.dart';
 import '../../utils/strip_photo_cell_layout.dart';
 import '../../views/widgets/cached_network_image.dart';
@@ -24,12 +25,15 @@ class FotoFlashbackStripPreview extends StatelessWidget {
     required this.filterId,
     this.frameId = kDefaultStripFrameId,
     this.frameOverlayUrl,
+    this.overlayCacheLandscape = false,
+    this.frameSlots = const [],
     this.frameCaption,
     this.stickerId = kDefaultStripStickerId,
     this.placements = const [],
     this.scribbles = const [],
     this.drawMode = false,
     this.imagesAreGraded = false,
+    this.imageJpegBytes = const [],
     this.serverComposePreviewUrl,
     this.isRefreshingComposePreview = false,
     this.layout,
@@ -43,18 +47,23 @@ class FotoFlashbackStripPreview extends StatelessWidget {
   });
 
   final List<String> imageDataUrls;
+
+  /// Direct PTP stills: raw JPEG bytes so the strip never re-decodes data-URLs.
+  final List<Uint8List> imageJpegBytes;
   final String filterId;
   final String frameId;
 
-  /// Admin scrapbook template overlay (https PNG) for live preview.
+  /// Occasion / scrapbook overlay PNG for live preview.
   final String? frameOverlayUrl;
+  final bool overlayCacheLandscape;
+  final List<StripTemplateSlot> frameSlots;
   final String? frameCaption;
 
   /// When true, [imageDataUrls] are already Sharp-graded — skip ColorFilter.
   final bool imagesAreGraded;
 
-  /// Classic 1-shot: server compose JPEG (filter + frame burned in). When set,
-  /// this is the same artifact as Your prints / DNP — skip Flutter chrome.
+  /// Classic 1-shot: server compose JPEG. Look picker does not pass this — the
+  /// print twin is for Continue / Result. Widget tests may still set it.
   final String? serverComposePreviewUrl;
   final bool isRefreshingComposePreview;
 
@@ -79,8 +88,7 @@ class FotoFlashbackStripPreview extends StatelessWidget {
   /// Print sheet 1200×1800 (4"×6" dual strip) — staff / compose reference.
   static const double defaultSheetWidth = 264;
   static const double defaultSheetHeight = 396;
-  static const double sheetAspectRatio =
-      defaultSheetWidth / defaultSheetHeight;
+  static const double sheetAspectRatio = defaultSheetWidth / defaultSheetHeight;
 
   /// Classic 1-shot landscape 6×4 (1800×1200).
   static const double single6x4AspectRatio = 1800 / 1200;
@@ -91,14 +99,13 @@ class FotoFlashbackStripPreview extends StatelessWidget {
   /// One 2×6 strip (half sheet width).
   static const double defaultStripWidth = defaultSheetWidth / 2;
   static const double defaultStripHeight = defaultSheetHeight;
-  static const double stripAspectRatio =
-      defaultStripWidth / defaultStripHeight;
+  static const double stripAspectRatio = defaultStripWidth / defaultStripHeight;
 
   /// Layout uses the single-strip aspect guests edit.
   static const double aspectRatio = stripAspectRatio;
 
-  /// Matches zenai `STRIP_PRINT.border / stripWidth` (4 / 600).
-  static const double printBorderRatio = 4 / 600;
+  /// Matches zenai `STRIP_PRINT.border / stripWidth` (10 / 600).
+  static const double printBorderRatio = 10 / 600;
 
   /// Compact credential burned onto Classic strips (not AI — brand only).
   static const String credentialLine = 'FOTOZEN AI';
@@ -106,10 +113,11 @@ class FotoFlashbackStripPreview extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final wysiwyg = layout ?? StripWysiwygLayout.defaults;
+    final shotCount = imageJpegBytes.isNotEmpty
+        ? imageJpegBytes.length
+        : imageDataUrls.length;
     final composeUrl = serverComposePreviewUrl?.trim() ?? '';
-    if (composeUrl.isNotEmpty &&
-        (imageDataUrls.length == 1 ||
-            imageDataUrls.length == kStripShotCount)) {
+    if (composeUrl.isNotEmpty && isValidClassicComposeShotCount(shotCount)) {
       return SizedBox(
         width: width,
         height: height,
@@ -121,7 +129,7 @@ class FotoFlashbackStripPreview extends StatelessWidget {
               child: CachedNetworkImage(
                 imageUrl: composeUrl,
                 fit: BoxFit.contain,
-                filterQuality: FilterQuality.high,
+                filterQuality: kFlashbackLookPreviewFilterQuality,
               ),
             ),
             if (isRefreshingComposePreview) _lookPreviewBusyOverlay(),
@@ -129,7 +137,7 @@ class FotoFlashbackStripPreview extends StatelessWidget {
         ),
       );
     }
-    if (imageDataUrls.length == 1) {
+    if (shotCount == 1) {
       return SizedBox(
         width: width,
         height: height,
@@ -137,9 +145,17 @@ class FotoFlashbackStripPreview extends StatelessWidget {
           fit: StackFit.expand,
           children: [
             _Single6x4Preview(
-              imageDataUrl: imageDataUrls.first,
+              imageDataUrl: imageDataUrls.isNotEmpty ? imageDataUrls.first : '',
+              jpegBytes:
+                  imageJpegBytes.isNotEmpty ? imageJpegBytes.first : null,
               filterId: filterId,
               frameId: frameId,
+              overlayUrl: isOccasionFrameId(frameId) ? frameOverlayUrl : null,
+              overlayCacheLandscape: overlayCacheLandscape,
+              photoHole: occasionSinglePhotoHole(
+                frameSlots,
+                landscape: overlayCacheLandscape,
+              ),
               imagesAreGraded: imagesAreGraded,
               placements: placements,
               scribbles: scribbles,
@@ -168,9 +184,9 @@ class FotoFlashbackStripPreview extends StatelessWidget {
           children: [
             FotoFlashbackSheetLayoutPreview(
               imageDataUrls: imageDataUrls,
-              colorFilter: imagesAreGraded
-                  ? null
-                  : stripPreviewColorFilter(filterId),
+              imageJpegBytes: imageJpegBytes,
+              colorFilter:
+                  imagesAreGraded ? null : stripPreviewColorFilter(filterId),
               layoutId: frameId,
               layout: wysiwyg,
               width: width,
@@ -243,9 +259,11 @@ class FotoFlashbackStripPreview extends StatelessWidget {
         children: [
           _FotoFlashbackSingleStrip(
             imageDataUrls: imageDataUrls,
+            imageJpegBytes: imageJpegBytes,
             filterId: filterId,
             frameId: frameId,
             frameOverlayUrl: frameOverlayUrl,
+            frameSlots: frameSlots,
             frameCaption: frameCaption,
             stickerId: stickerId,
             imagesAreGraded: imagesAreGraded,
@@ -294,6 +312,18 @@ class FotoFlashbackStripPreview extends StatelessWidget {
   }
 }
 
+/// Strip length behind a preview: the images it was handed, snapped to a
+/// supported strip length (3 or 4) so a partially-hydrated list still lays out.
+int stripPreviewShotCount({
+  required List<String> imageDataUrls,
+  required List<Uint8List> imageJpegBytes,
+}) {
+  final count =
+      imageJpegBytes.isNotEmpty ? imageJpegBytes.length : imageDataUrls.length;
+  if (kClassicStripShotCounts.contains(count)) return count;
+  return kStripShotCount;
+}
+
 Widget _lookPreviewBusyOverlay() {
   return const ColoredBox(
     color: Color(0x66000000),
@@ -313,6 +343,7 @@ Widget _lookPreviewBusyOverlay() {
 class _FotoFlashbackSingleStrip extends StatelessWidget {
   const _FotoFlashbackSingleStrip({
     required this.imageDataUrls,
+    this.imageJpegBytes = const [],
     required this.filterId,
     required this.frameId,
     required this.stickerId,
@@ -323,6 +354,7 @@ class _FotoFlashbackSingleStrip extends StatelessWidget {
     required this.width,
     required this.height,
     this.frameOverlayUrl,
+    this.frameSlots = const [],
     this.frameCaption,
     this.imagesAreGraded = false,
     this.layout,
@@ -334,9 +366,11 @@ class _FotoFlashbackSingleStrip extends StatelessWidget {
   });
 
   final List<String> imageDataUrls;
+  final List<Uint8List> imageJpegBytes;
   final String filterId;
   final String frameId;
   final String? frameOverlayUrl;
+  final List<StripTemplateSlot> frameSlots;
   final String? frameCaption;
   final String stickerId;
   final List<StripStickerPlacement> placements;
@@ -356,58 +390,88 @@ class _FotoFlashbackSingleStrip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final wysiwyg = layout ?? StripWysiwygLayout.defaults;
-    final images =
-        imageDataUrls.take(kStripShotCount).map(_tryBytesFromDataUrl).toList();
     final chrome = StripChromeLook.forFrame(
       frameId,
       borderRatio: wysiwyg.borderRatio,
       accentStrokeRatio: wysiwyg.accentStrokeRatio,
       noirAccentStrokeRatio: wysiwyg.noirAccentStrokeRatio,
     );
+    // Strip length drives cell height only — the 2×6 sheet is a fixed print.
+    final shotCount = stripPreviewShotCount(
+      imageDataUrls: imageDataUrls,
+      imageJpegBytes: imageJpegBytes,
+    );
+    final templateSlots = resolveStripPreviewTemplateSlots(
+      frameId: frameId,
+      shotCount: shotCount,
+      catalogSlots: frameSlots,
+      overlayUrl: frameOverlayUrl,
+    );
+    final hasOverlay = templateSlots != null;
     final cells = computeStripPhotoCellRects(
       frameId: frameId,
       stripWidth: width,
       stripHeight: height,
       layout: wysiwyg,
+      shotCount: shotCount,
+      templateSlots: templateSlots,
     );
     final borderPad = stripChromeBorderPad(
       frameId: frameId,
       stripWidth: width,
       layout: wysiwyg,
     );
-    final photoFit =
-        stripPhotoCellUsesContainFit(frameId) ? BoxFit.contain : BoxFit.cover;
+    final photoFit = stripPhotoCellUsesContainFit(
+      frameId,
+      shotCount: shotCount,
+    )
+        ? BoxFit.contain
+        : BoxFit.cover;
     final letterbox = stripPhotoCellLetterboxColor(frameId);
-    final cacheW = flashbackLookPreviewCacheWidth(
+    final dpr = MediaQuery.devicePixelRatioOf(context);
+    final overlayDecode = flashbackLookOverlayDecodeSize(
       layoutWidth: width,
-      devicePixelRatio: MediaQuery.devicePixelRatioOf(context),
+      layoutHeight: height,
+      devicePixelRatio: dpr,
     );
-    final photoStack = Stack(
-      clipBehavior: Clip.hardEdge,
-      children: [
-        for (var i = 0; i < kStripShotCount; i++)
-          Positioned.fromRect(
-            rect: cells[i].rect,
-            child: images.length > i && images[i] != null
-                ? ColoredBox(
-                    color: letterbox,
-                    child: _lookPreviewPhoto(
-                      bytes: images[i]!,
-                      fit: photoFit,
-                      cacheWidth: cacheW,
-                      imageKey: i,
-                    ),
-                  )
-                : ColoredBox(color: Colors.black12),
-          ),
-      ],
+    final photoStack = RepaintBoundary(
+      child: Stack(
+        clipBehavior: Clip.hardEdge,
+        children: [
+          for (var i = 0; i < cells.length; i++)
+            Positioned.fromRect(
+              rect: cells[i].rect,
+              child: _lookPreviewSlot(
+                jpegBytes: i < imageJpegBytes.length ? imageJpegBytes[i] : null,
+                dataUrl: i < imageDataUrls.length ? imageDataUrls[i] : '',
+                fit: photoFit,
+                alignment: photoFit == BoxFit.cover
+                    ? _coverSlotAlignment(
+                        width: cells[i].width,
+                        height: cells[i].height,
+                        jpegBytes: i < imageJpegBytes.length
+                            ? imageJpegBytes[i]
+                            : null,
+                        dataUrl: i < imageDataUrls.length
+                            ? imageDataUrls[i]
+                            : '',
+                      )
+                    : Alignment.center,
+                cacheWidth: flashbackLookPreviewCacheWidth(
+                  layoutWidth: cells[i].width,
+                  devicePixelRatio: dpr,
+                ),
+                letterbox: letterbox,
+              ),
+            ),
+        ],
+      ),
     );
 
     return Container(
-      key: ValueKey<String>('strip_chrome_$frameId'),
       width: width,
       height: height,
-      color: chrome.fill,
+      color: hasOverlay ? Colors.white : chrome.fill,
       child: Stack(
         clipBehavior: Clip.hardEdge,
         children: [
@@ -417,19 +481,25 @@ class _FotoFlashbackSingleStrip extends StatelessWidget {
                   colorFilter: stripPreviewColorFilter(filterId),
                   child: photoStack,
                 ),
-          StripChromeOverlay(
-            look: chrome,
-            width: width,
-            height: height,
-            borderPad: borderPad,
-          ),
-          if (frameOverlayUrl != null && frameOverlayUrl!.isNotEmpty)
+          if (!hasOverlay)
+            StripChromeOverlay(
+              key: ValueKey<String>('strip_chrome_$frameId'),
+              look: chrome,
+              width: width,
+              height: height,
+              borderPad: borderPad,
+            ),
+          if (hasOverlay)
             Positioned.fill(
+              key: ValueKey<String>('strip_chrome_$frameId'),
               child: IgnorePointer(
-                child: Image.network(
-                  frameOverlayUrl!,
+                child: CachedNetworkImage(
+                  imageUrl: frameOverlayUrl!.trim(),
+                  cacheKey: classicFrameOverlayCacheKey(frameId),
                   fit: BoxFit.fill,
-                  errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                  filterQuality: kFlashbackLookPreviewFilterQuality,
+                  cacheWidth: overlayDecode.cacheWidth,
+                  cacheHeight: overlayDecode.cacheHeight,
                 ),
               ),
             ),
@@ -567,6 +637,7 @@ class _PlacementSticker extends StatelessWidget {
   final StripStickerPlacement placement;
   final double stripWidth;
   final double stripHeight;
+
   /// When set (sheet layouts), size icons from this width instead of [stripWidth].
   final double? glyphRefWidth;
   final StripWysiwygLayout? layout;
@@ -702,12 +773,12 @@ List<Widget> _stickerOverlays(String stickerId, double width, double height) {
       ];
     case 'sparkles':
       return [
-        _stickerSparkle(width * 0.08, height * 0.04, width * 0.14,
-            const Color(0xFFFFD54A)),
-        _stickerSparkle(width * 0.75, height * 0.4, width * 0.12,
-            const Color(0xFFFFC107)),
-        _stickerSparkle(width * 0.18, height * 0.85, width * 0.1,
-            const Color(0xFFFFD54A)),
+        _stickerSparkle(
+            width * 0.08, height * 0.04, width * 0.14, const Color(0xFFFFD54A)),
+        _stickerSparkle(
+            width * 0.75, height * 0.4, width * 0.12, const Color(0xFFFFC107)),
+        _stickerSparkle(
+            width * 0.18, height * 0.85, width * 0.1, const Color(0xFFFFD54A)),
       ];
     case 'stars':
       return [
@@ -854,44 +925,114 @@ Uint8List? _tryBytesFromDataUrl(String dataUrl) {
   }
 }
 
-Widget _lookPreviewPhoto({
-  required Uint8List bytes,
-  required BoxFit fit,
-  int? cacheWidth,
-  Object? imageKey,
+Alignment _coverSlotAlignment({
+  required double width,
+  required double height,
+  Uint8List? jpegBytes,
+  String dataUrl = '',
 }) {
-  return Image.memory(
-    bytes,
-    key: imageKey != null ? ValueKey<Object>(imageKey) : null,
-    fit: fit,
-    width: double.infinity,
-    height: double.infinity,
-    gaplessPlayback: true,
-    filterQuality: FilterQuality.high,
-    cacheWidth: cacheWidth,
-    frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
-      if (wasSynchronouslyLoaded || frame != null) return child;
-      return const ColoredBox(
-        color: Color(0xFF1A1A1A),
-        child: Center(
-          child: SizedBox(
-            width: 28,
-            height: 28,
-            child: CircularProgressIndicator(
-              strokeWidth: 2.5,
-              color: Colors.white70,
-            ),
-          ),
-        ),
-      );
-    },
-    errorBuilder: (_, __, ___) => const ColoredBox(
-      color: Color(0xFF1A1A1A),
-      child: Center(
-        child: Icon(Icons.broken_image_outlined, color: Colors.white54, size: 40),
+  return coverPhotoAlignmentForJpeg(
+    windowWidth: width,
+    windowHeight: height,
+    jpegBytes: jpegBytes ?? _tryBytesFromDataUrl(dataUrl),
+  );
+}
+
+Widget _lookPreviewSlot({
+  required Uint8List? jpegBytes,
+  required String dataUrl,
+  required BoxFit fit,
+  required int? cacheWidth,
+  Alignment alignment = Alignment.center,
+  Color letterbox = Colors.black,
+}) {
+  final hasPhoto = jpegBytes != null || dataUrl.trim().isNotEmpty;
+  if (!hasPhoto) return const ColoredBox(color: Colors.black12);
+  return ColoredBox(
+    color: letterbox,
+    child: ClipRect(
+      child: _LookPreviewPhoto(
+        jpegBytes: jpegBytes,
+        dataUrl: dataUrl,
+        fit: fit,
+        alignment: alignment,
+        cacheWidth: cacheWidth,
       ),
     ),
   );
+}
+
+/// Holds JPEG bytes so parent rebuilds do not re-decode.
+///
+/// Direct PTP paints [jpegBytes] from disk. SDK still uses [dataUrl]. Mixing
+/// the two is what flickered: PTP hydrated into new data-URLs after the strip
+/// was already on screen.
+class _LookPreviewPhoto extends StatefulWidget {
+  const _LookPreviewPhoto({
+    required this.dataUrl,
+    required this.fit,
+    required this.cacheWidth,
+    this.alignment = Alignment.center,
+    this.jpegBytes,
+  });
+
+  final Uint8List? jpegBytes;
+  final String dataUrl;
+  final BoxFit fit;
+  final Alignment alignment;
+  final int? cacheWidth;
+
+  @override
+  State<_LookPreviewPhoto> createState() => _LookPreviewPhotoState();
+}
+
+class _LookPreviewPhotoState extends State<_LookPreviewPhoto> {
+  Uint8List? _bytes;
+
+  @override
+  void initState() {
+    super.initState();
+    _syncBytes();
+  }
+
+  @override
+  void didUpdateWidget(covariant _LookPreviewPhoto oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.jpegBytes, widget.jpegBytes) ||
+        (widget.jpegBytes == null && oldWidget.dataUrl != widget.dataUrl)) {
+      setState(_syncBytes);
+    }
+  }
+
+  void _syncBytes() {
+    _bytes = widget.jpegBytes ?? _tryBytesFromDataUrl(widget.dataUrl);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bytes = _bytes;
+    if (bytes == null) return _lookPreviewMissingPhoto();
+    return Image.memory(
+      bytes,
+      fit: widget.fit,
+      alignment: widget.alignment,
+      width: double.infinity,
+      height: double.infinity,
+      gaplessPlayback: true,
+      filterQuality: kFlashbackLookPreviewFilterQuality,
+      cacheWidth: widget.cacheWidth,
+      errorBuilder: (_, __, ___) => const ColoredBox(
+        color: Color(0xFF1A1A1A),
+        child: Center(
+          child: Icon(
+            Icons.broken_image_outlined,
+            color: Colors.white54,
+            size: 40,
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 Widget _lookPreviewMissingPhoto() {
@@ -903,18 +1044,22 @@ Widget _lookPreviewMissingPhoto() {
   );
 }
 
-/// Classic 1-shot preview (matches zenai composeSingle6x4 cover fill).
+/// Classic 1-shot preview (fills the print; occasion overlay maps to the sheet).
 class _Single6x4Preview extends StatelessWidget {
   const _Single6x4Preview({
     required this.imageDataUrl,
     required this.filterId,
     required this.frameId,
+    this.overlayUrl,
+    this.overlayCacheLandscape = false,
+    this.photoHole,
     required this.imagesAreGraded,
     required this.placements,
     required this.scribbles,
     required this.drawMode,
     required this.width,
     required this.height,
+    this.jpegBytes,
     this.onMovePlacement,
     this.onRemovePlacement,
     this.onScribbleStart,
@@ -923,8 +1068,12 @@ class _Single6x4Preview extends StatelessWidget {
   });
 
   final String imageDataUrl;
+  final Uint8List? jpegBytes;
   final String filterId;
   final String frameId;
+  final String? overlayUrl;
+  final bool overlayCacheLandscape;
+  final StripTemplateSlot? photoHole;
   final bool imagesAreGraded;
   final List<StripStickerPlacement> placements;
   final List<StripScribbleStroke> scribbles;
@@ -938,102 +1087,177 @@ class _Single6x4Preview extends StatelessWidget {
   final VoidCallback? onScribbleEnd;
 
   Color get _matte {
-    if (frameId == 'noir') return const Color(0xFF111111);
-    return Colors.white;
+    if (overlayUrl != null && overlayUrl!.trim().isNotEmpty) {
+      return const Color(0xFF121212);
+    }
+    return stripPhotoCellLetterboxColor(frameId);
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final bytes = _tryBytesFromDataUrl(imageDataUrl);
-    final margin = width * 0.027; // ~48/1800
-    // Cover the print frame (portrait 4×6 or landscape 6×4) — letterboxing
-    // looked like "just whitespace" when toggling orientation.
-    final cacheW = flashbackLookPreviewCacheWidth(
-      layoutWidth: width,
-      devicePixelRatio: MediaQuery.devicePixelRatioOf(context),
+  Widget _singleClassicPhotoWell({
+    required StripTemplateSlot hole,
+    required Widget photoLayer,
+    required double boxWidth,
+    required double boxHeight,
+  }) {
+    return Positioned(
+      left: hole.left * boxWidth,
+      top: hole.top * boxHeight,
+      width: hole.width * boxWidth,
+      height: hole.height * boxHeight,
+      child: ClipRect(
+        child: ColoredBox(
+          color: stripPhotoCellLetterboxColor(frameId),
+          child: photoLayer,
+        ),
+      ),
     );
-    final photo = bytes == null
+  }
+
+  Widget _chromeStack({
+    required BuildContext context,
+    required double boxWidth,
+    required double boxHeight,
+    required String overlay,
+  }) {
+    final landscapeSheet = boxWidth > boxHeight;
+    final hasOverlay = overlay.isNotEmpty;
+    final dpr = MediaQuery.devicePixelRatioOf(context);
+    final overlayDecode = flashbackLookOverlayDecodeSize(
+      layoutWidth: boxWidth,
+      layoutHeight: boxHeight,
+      devicePixelRatio: dpr,
+    );
+    final hasPhoto = jpegBytes != null || imageDataUrl.trim().isNotEmpty;
+    final hole = resolveClassicSinglePhotoHole(
+      hasOverlay: hasOverlay,
+      landscape: landscapeSheet,
+      overlayHole: photoHole,
+      frameId: frameId,
+    );
+    final wellW = hole.width * boxWidth;
+    final wellH = hole.height * boxHeight;
+    final cacheW = flashbackLookPreviewCacheWidth(
+      layoutWidth: wellW,
+      devicePixelRatio: dpr,
+    );
+    final containPhoto = stripPhotoCellUsesContainFit(frameId, shotCount: 1);
+    final photo = !hasPhoto
         ? _lookPreviewMissingPhoto()
-        : _lookPreviewPhoto(
-            bytes: bytes,
-            fit: BoxFit.cover,
+        : _LookPreviewPhoto(
+            jpegBytes: jpegBytes,
+            dataUrl: imageDataUrl,
+            fit: containPhoto ? BoxFit.contain : BoxFit.cover,
+            alignment: containPhoto
+                ? Alignment.center
+                : _coverSlotAlignment(
+                    width: wellW,
+                    height: wellH,
+                    jpegBytes: jpegBytes,
+                    dataUrl: imageDataUrl,
+                  ),
             cacheWidth: cacheW,
-            imageKey: 0,
           );
-    final photoLayer = bytes == null || imagesAreGraded
+    final photoLayer = !hasPhoto || imagesAreGraded
         ? photo
         : ColorFiltered(
             colorFilter: stripPreviewColorFilter(filterId),
             child: photo,
           );
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        _singleClassicPhotoWell(
+          hole: hole,
+          photoLayer: photoLayer,
+          boxWidth: boxWidth,
+          boxHeight: boxHeight,
+        ),
+        if (frameId == 'filmstrip' && !hasOverlay)
+          CustomPaint(
+            painter: _SingleFilmstripSprocketPainter(
+              margin: hole.left * boxWidth,
+            ),
+          ),
+        if (hasOverlay)
+          Positioned.fill(
+            key: ValueKey<String>('strip_chrome_$frameId'),
+            child: IgnorePointer(
+              child: CachedNetworkImage(
+                imageUrl: overlay,
+                cacheKey: classicFrameOverlayCacheKey(
+                  frameId,
+                  landscape: overlayCacheLandscape,
+                ),
+                fit: BoxFit.fill,
+                filterQuality: kFlashbackLookPreviewFilterQuality,
+                cacheWidth: overlayDecode.cacheWidth,
+                cacheHeight: overlayDecode.cacheHeight,
+              ),
+            ),
+          ),
+        if (placements.isNotEmpty)
+          for (final p in placements)
+            _PlacementSticker(
+              placement: p,
+              stripWidth: boxWidth,
+              stripHeight: boxHeight,
+              glyphRefWidth: boxWidth * 0.35,
+              layout: StripWysiwygLayout.defaults,
+              absorbPointers: drawMode,
+              onMove: onMovePlacement,
+              onRemove: onRemovePlacement,
+            ),
+        if (scribbles.isNotEmpty)
+          Positioned.fill(
+            child: IgnorePointer(
+              child: CustomPaint(
+                painter: _ScribblePainter(
+                  strokes: scribbles,
+                  stripWidth: boxWidth,
+                  stripHeight: boxHeight,
+                ),
+              ),
+            ),
+          ),
+        if (drawMode)
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onPanStart: (details) {
+                if (onScribbleStart == null) return;
+                onScribbleStart!(
+                  (details.localPosition.dx / boxWidth).clamp(0.0, 1.0),
+                  (details.localPosition.dy / boxHeight).clamp(0.0, 1.0),
+                );
+              },
+              onPanUpdate: (details) {
+                if (onScribbleUpdate == null) return;
+                onScribbleUpdate!(
+                  (details.localPosition.dx / boxWidth).clamp(0.0, 1.0),
+                  (details.localPosition.dy / boxHeight).clamp(0.0, 1.0),
+                );
+              },
+              onPanEnd: (_) => onScribbleEnd?.call(),
+              onPanCancel: onScribbleEnd,
+            ),
+          ),
+      ],
+    );
+  }
 
+  @override
+  Widget build(BuildContext context) {
+    final overlay = overlayUrl?.trim() ?? '';
     return Container(
       key: ValueKey<String>('single6x4_$frameId'),
       width: width,
       height: height,
       color: _matte,
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          Padding(
-            padding: EdgeInsets.all(margin),
-            child: ColoredBox(
-              // Dark well so a slow decode never reads as an empty white card.
-              color: const Color(0xFF121212),
-              child: photoLayer,
-            ),
-          ),
-          if (frameId == 'filmstrip')
-            CustomPaint(
-              painter: _SingleFilmstripSprocketPainter(margin: margin),
-            ),
-          if (placements.isNotEmpty)
-            for (final p in placements)
-              _PlacementSticker(
-                placement: p,
-                stripWidth: width,
-                stripHeight: height,
-                glyphRefWidth: width * 0.35,
-                layout: StripWysiwygLayout.defaults,
-                absorbPointers: drawMode,
-                onMove: onMovePlacement,
-                onRemove: onRemovePlacement,
-              ),
-          if (scribbles.isNotEmpty)
-            Positioned.fill(
-              child: IgnorePointer(
-                child: CustomPaint(
-                  painter: _ScribblePainter(
-                    strokes: scribbles,
-                    stripWidth: width,
-                    stripHeight: height,
-                  ),
-                ),
-              ),
-            ),
-          if (drawMode)
-            Positioned.fill(
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onPanStart: (details) {
-                  if (onScribbleStart == null) return;
-                  onScribbleStart!(
-                    (details.localPosition.dx / width).clamp(0.0, 1.0),
-                    (details.localPosition.dy / height).clamp(0.0, 1.0),
-                  );
-                },
-                onPanUpdate: (details) {
-                  if (onScribbleUpdate == null) return;
-                  onScribbleUpdate!(
-                    (details.localPosition.dx / width).clamp(0.0, 1.0),
-                    (details.localPosition.dy / height).clamp(0.0, 1.0),
-                  );
-                },
-                onPanEnd: (_) => onScribbleEnd?.call(),
-                onPanCancel: onScribbleEnd,
-              ),
-            ),
-        ],
+      child: _chromeStack(
+        context: context,
+        boxWidth: width,
+        boxHeight: height,
+        overlay: overlay,
       ),
     );
   }
@@ -1048,7 +1272,7 @@ class _SingleFilmstripSprocketPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final rail = Paint()..color = const Color(0xFF1A1A1A);
     final hole = Paint()..color = Colors.white;
-    final railW = margin.clamp(8.0, 28.0);
+    final railW = margin < 8 ? 8.0 : margin;
     canvas.drawRect(Rect.fromLTWH(0, 0, railW, size.height), rail);
     canvas.drawRect(
       Rect.fromLTWH(size.width - railW, 0, railW, size.height),

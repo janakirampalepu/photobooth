@@ -1,10 +1,14 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http_mock_adapter/http_mock_adapter.dart';
 import 'package:photobooth/services/api_service.dart';
+import 'package:photobooth/services/catalog_disk_cache.dart';
+import 'package:photobooth/services/kiosk_manager.dart';
 import 'package:photobooth/services/session_manager.dart';
+import 'package:photobooth/utils/app_strings.dart';
 import 'package:photobooth/utils/constants.dart';
 import 'package:photobooth/utils/exceptions.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -399,11 +403,15 @@ void main() {
       marketingSmsOptIn: false,
       marketingWhatsappOptIn: true,
       fcmToken: 'fcm',
+      receiptNumber: 'FZ/ODEON-01/2627/00147',
+      receiptId: '550e8400-e29b-41d4-a716-446655440000',
     );
     expect(seen?['customerEmail'], 'a@b.co');
     expect(seen?['marketingEmailOptIn'], true);
     expect(seen?['marketingSmsOptIn'], false);
     expect(seen?['marketingWhatsappOptIn'], true);
+    expect(seen?['receiptNumber'], 'FZ/ODEON-01/2627/00147');
+    expect(seen?['id'], '550e8400-e29b-41d4-a716-446655440000');
   });
 
   test('applySessionDiscount validates and posts body', () async {
@@ -464,6 +472,35 @@ void main() {
     expect(catalog.printSize, 's6x2_2');
   });
 
+  test('fetchStripFilters maps 404 without Dio essay', () async {
+    final dir = await Directory.systemTemp.createTemp('strip_filters_404_');
+    addTearDown(() async {
+      if (await dir.exists()) await dir.delete(recursive: true);
+    });
+    await KioskManager().setKioskCode('K404MISS');
+    final isolated = ApiService(
+      dio: dio,
+      catalogDiskCache: CatalogDiskCache(resolveDirectory: () async => dir),
+    );
+    adapter.onGet(
+      '/api/strip/filters',
+      (server) => server.reply(404, {'error': 'missing'}),
+    );
+    await expectLater(
+      isolated.fetchStripFilters(),
+      throwsA(
+        isA<ApiException>()
+            .having((e) => e.statusCode, 'statusCode', 404)
+            .having(
+              (e) => e.message,
+              'message',
+              AppStrings.flashbackFiltersLoadFailed,
+            ),
+      ),
+    );
+    await KioskManager().setKioskCode('K1');
+  });
+
   test('fetchStripFilters rejects unexpected payload', () async {
     adapter.onGet(
       '/api/strip/filters',
@@ -472,7 +509,7 @@ void main() {
     expect(api.fetchStripFilters(), throwsA(isA<ApiException>()));
   });
 
-  test('cleanStripOverlays accepts one or four shots', () async {
+  test('cleanStripOverlays accepts one, three or four shots', () async {
     expect(
       () => api.cleanStripOverlays(sessionId: 's', images: const ['a', 'b']),
       throwsA(isA<ApiException>()),
@@ -513,6 +550,24 @@ void main() {
     expect(cleaned.images.first.endsWith('_clean'), isTrue);
     expect(cleaned.cleanedFlags, [true, false, true, false]);
     expect(cleaned.allCleaned, isFalse);
+
+    final threeImages = List.filled(3, 'data:image/jpeg;base64,xyz');
+    adapter.onPost(
+      '/api/sessions/sess-1/strip/clean-overlays',
+      (server) => server.reply(200, {
+        'success': true,
+        'images': threeImages.map((e) => '${e}_clean').toList(),
+        'cleaned': [true, true, true],
+        'overlayCleanup': {'detectedCount': 3, 'cleanedCount': 3},
+      }),
+      data: Matchers.any,
+    );
+    final threeShot = await api.cleanStripOverlays(
+      sessionId: 'sess-1',
+      images: threeImages,
+    );
+    expect(threeShot.images, hasLength(3));
+    expect(threeShot.allCleaned, isTrue);
   });
 
   test('composeStrip validates shot count and returns print url', () async {
@@ -569,6 +624,27 @@ void main() {
     );
     expect(single.printSize, 's6x4');
     expect(single.copiesOnSheet, 1);
+
+    // A 3-shot strip is the same dual 2×6 print as a 4-shot one.
+    adapter.onPost(
+      '/api/sessions/sess-three/strip/compose',
+      (server) => server.reply(200, {
+        'imageUrl': 'https://example.com/strip3.jpg',
+        'stripCompositeUrl': 'https://example.com/composite3.jpg',
+        'filter': 'mono',
+        'printSize': 's6x2_2',
+        'copiesOnSheet': 2,
+      }),
+      data: Matchers.any,
+    );
+    final three = await api.composeStrip(
+      sessionId: 'sess-three',
+      images: List.filled(3, 'data:image/jpeg;base64,abc'),
+      filter: 'mono',
+    );
+    expect(three.printSize, 's6x2_2');
+    expect(three.copiesOnSheet, 2);
+    expect(three.printImageUrl, 'https://example.com/composite3.jpg');
     expect(single.printImageUrl, 'https://example.com/single6x4.jpg');
   });
 
@@ -614,6 +690,26 @@ void main() {
       api.composeStrip(sessionId: 'sess-bad', images: images),
       throwsA(isA<ApiException>()),
     );
+
+    adapter.onPost(
+      '/api/sessions/sess-400/strip/compose',
+      (server) => server.reply(400, {
+        'error': 'Select a FotoFlashback theme before composing the strip',
+      }),
+      data: Matchers.any,
+    );
+    await expectLater(
+      api.composeStrip(sessionId: 'sess-400', images: images),
+      throwsA(
+        isA<ApiException>()
+            .having((e) => e.statusCode, 'statusCode', 400)
+            .having(
+              (e) => e.message,
+              'message',
+              contains('FotoFlashback theme'),
+            ),
+      ),
+    );
   });
 
   test('strip APIs wrap DioException', () async {
@@ -645,10 +741,197 @@ void main() {
         isA<ApiException>().having(
           (e) => e.message,
           'message',
-          contains('compose strip'),
+          AppStrings.flashbackComposeFailed,
         ),
       ),
     );
+    expect(
+      await badApi.registerStripDeliverable(
+        sessionId: 's',
+        imageDataUrl: 'data:image/jpeg;base64,abc',
+      ),
+      isNull,
+    );
   });
 
+  test('registerStripDeliverable uploads data URLs and fail-opens', () async {
+    expect(
+      await api.registerStripDeliverable(
+        sessionId: '',
+        imageDataUrl: 'data:image/jpeg;base64,xx',
+      ),
+      isNull,
+    );
+    expect(
+      await api.registerStripDeliverable(
+        sessionId: 'sess-1',
+        imageDataUrl: '/api/img/x.jpg',
+      ),
+      isNull,
+    );
+    adapter.onPost(
+      '/api/sessions/sess-1/strip/deliverable',
+      (server) => server.reply(200, {
+        'success': true,
+        'imageUrl': '/api/img/fotoflashback/web.jpg',
+      }),
+      data: Matchers.any,
+    );
+    expect(
+      await api.registerStripDeliverable(
+        sessionId: 'sess-1',
+        imageDataUrl: 'data:image/jpeg;base64,xx',
+      ),
+      '/api/img/fotoflashback/web.jpg',
+    );
+    adapter.onPost(
+      '/api/sessions/sess-map/strip/deliverable',
+      (server) => server.reply(200, <dynamic, dynamic>{
+        'success': true,
+        'imageUrl': '/api/img/fotoflashback/map.jpg',
+      }),
+      data: Matchers.any,
+    );
+    expect(
+      await api.registerStripDeliverable(
+        sessionId: 'sess-map',
+        imageDataUrl: 'data:image/jpeg;base64,xx',
+      ),
+      '/api/img/fotoflashback/map.jpg',
+    );
+    adapter.onPost(
+      '/api/sessions/sess-fail/strip/deliverable',
+      (server) => server.reply(200, {'success': false}),
+      data: Matchers.any,
+    );
+    expect(
+      await api.registerStripDeliverable(
+        sessionId: 'sess-fail',
+        imageDataUrl: 'data:image/jpeg;base64,xx',
+      ),
+      isNull,
+    );
+    adapter.onPost(
+      '/api/sessions/sess-empty/strip/deliverable',
+      (server) => server.reply(200, {'success': true, 'imageUrl': '  '}),
+      data: Matchers.any,
+    );
+    expect(
+      await api.registerStripDeliverable(
+        sessionId: 'sess-empty',
+        imageDataUrl: 'data:image/jpeg;base64,xx',
+      ),
+      isNull,
+    );
+    adapter.onPost(
+      '/api/sessions/sess-400/strip/deliverable',
+      (server) => server.reply(400, {'error': 'bad'}),
+      data: Matchers.any,
+    );
+    expect(
+      await api.registerStripDeliverable(
+        sessionId: 'sess-400',
+        imageDataUrl: 'data:image/jpeg;base64,xx',
+      ),
+      isNull,
+    );
+    adapter.onPost(
+      '/api/sessions/sess-text/strip/deliverable',
+      (server) => server.reply(200, 'not-json'),
+      data: Matchers.any,
+    );
+    expect(
+      await api.registerStripDeliverable(
+        sessionId: 'sess-text',
+        imageDataUrl: 'data:image/jpeg;base64,xx',
+      ),
+      isNull,
+    );
+  });
+
+  test('ingest kiosk entities and assets', () async {
+    expect(
+      () => api.ingestKioskEntities(kioskCode: ' ', items: const []),
+      throwsA(isA<ApiException>()),
+    );
+    expect(
+      () => api.ingestKioskAsset(
+        kioskCode: 'K1',
+        prefix: 'generated',
+        filename: 'a.jpg',
+        bytes: const [],
+      ),
+      throwsA(isA<ApiException>()),
+    );
+    adapter.onPost(
+      '/api/kiosk/ingest',
+      (server) => server.reply(200, {'ok': true, 'items': []}),
+      data: Matchers.any,
+    );
+    await api.ingestKioskEntities(
+      kioskCode: 'k1',
+      items: [
+        {'entityType': 'session', 'entityId': 's1', 'payload': {}},
+      ],
+    );
+    adapter.onPost(
+      '/api/kiosk/ingest/asset',
+      (server) => server.reply(200, {'ok': true}),
+      data: Matchers.any,
+    );
+    await api.ingestKioskAsset(
+      kioskCode: 'k1',
+      prefix: 'generated',
+      filename: 'a.jpg',
+      bytes: const [1, 2, 3],
+    );
+  });
+
+  test('post kiosk heartbeat', () async {
+    expect(
+      () => api.postKioskHeartbeat(kioskCode: ' ', appVersion: '1'),
+      throwsA(isA<ApiException>()),
+    );
+    adapter.onPost(
+      '/api/kiosk/heartbeat',
+      (server) => server.reply(200, {'ok': true}),
+      data: Matchers.any,
+    );
+    await api.postKioskHeartbeat(
+      kioskCode: 'k1',
+      appVersion: '2026.9.9',
+      processExits: [
+        {'timestampMs': 1, 'reason': 'LOW_MEMORY'},
+      ],
+    );
+  });
+
+  test('ingest wraps DioException', () async {
+    final bad = Dio(BaseOptions(baseUrl: dio.options.baseUrl));
+    bad.interceptors.add(
+      InterceptorsWrapper(
+        onRequest: (o, h) => h.reject(
+          DioException(requestOptions: o, message: 'net down'),
+        ),
+      ),
+    );
+    final badApi = ApiService(dio: bad);
+    await expectLater(
+      badApi.ingestKioskEntities(kioskCode: 'K1', items: const []),
+      throwsA(isA<ApiException>()),
+    );
+    await expectLater(
+      badApi.ingestKioskAsset(
+        kioskCode: 'K1',
+        prefix: 'generated',
+        filename: 'a.jpg',
+        bytes: const [1],
+      ),
+      throwsA(isA<ApiException>()),
+    );
+    await expectLater(
+      badApi.postKioskHeartbeat(kioskCode: 'K1', appVersion: '1'),
+      throwsA(isA<ApiException>()),
+    );
+  });
 }

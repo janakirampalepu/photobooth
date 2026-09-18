@@ -1,4 +1,25 @@
+import '../utils/event_station_timing.dart';
 import '../utils/secure_image_url.dart';
+
+class EventDeliveryStats {
+  final int guestsRegistered;
+  final int processed;
+  final int digitalSent;
+
+  const EventDeliveryStats({
+    this.guestsRegistered = 0,
+    this.processed = 0,
+    this.digitalSent = 0,
+  });
+
+  factory EventDeliveryStats.fromJson(Map<String, dynamic> json) {
+    return EventDeliveryStats(
+      guestsRegistered: _asInt(json['guestsRegistered']),
+      processed: _asInt(json['processed']),
+      digitalSent: _asInt(json['digitalSent']),
+    );
+  }
+}
 
 class EventStationStats {
   final int captures;
@@ -40,11 +61,13 @@ class EventCaptureStationItem {
   final String sessionId;
   final String status;
   final List<String> previewUrls;
+  final EventStationJobTimes times;
 
   const EventCaptureStationItem({
     required this.sessionId,
     required this.status,
     this.previewUrls = const [],
+    this.times = const EventStationJobTimes(),
   });
 
   factory EventCaptureStationItem.fromJson(Map<String, dynamic> json) {
@@ -52,6 +75,7 @@ class EventCaptureStationItem {
       sessionId: (json['sessionId'] ?? json['id'] ?? '').toString(),
       status: _bucketStatus(json['status']),
       previewUrls: _stringList(json['previewUrls']),
+      times: EventStationJobTimes.fromJson(json),
     );
   }
 
@@ -64,6 +88,7 @@ class EventCaptureStationItem {
     return EventCaptureStationItem(
       sessionId: sessionId,
       status: status,
+      times: times,
       previewUrls: [
         for (final url in previewUrls)
           stampEventStationImageUrl(
@@ -82,12 +107,14 @@ class EventThemeStationJob {
   final String sessionId;
   final String status;
   final List<String> previewUrls;
+  final EventStationJobTimes times;
 
   const EventThemeStationJob({
     required this.id,
     required this.sessionId,
     required this.status,
     this.previewUrls = const [],
+    this.times = const EventStationJobTimes(),
   });
 
   factory EventThemeStationJob.fromJson(Map<String, dynamic> json) {
@@ -95,15 +122,20 @@ class EventThemeStationJob {
     final src = nested is Map
         ? Map<String, dynamic>.from(nested)
         : json;
+    final merged = {...src, ...json};
     return EventThemeStationJob(
       id: (src['id'] ?? json['id'] ?? '').toString(),
       sessionId: (src['sessionId'] ?? json['sessionId'] ?? '').toString(),
       status: _bucketStatus(src['status'] ?? json['status']),
       previewUrls: _stringList(json['previewUrls'] ?? src['previewUrls']),
+      times: EventStationJobTimes.fromJson(merged),
     );
   }
 
   bool get isValid => id.isNotEmpty && sessionId.isNotEmpty;
+
+  bool get canSkip => status == 'PENDING' || status == 'CLAIMED';
+  bool get canRetry => times.isFailed || times.isSkipped;
 
   EventThemeStationJob withStationImageAuth({
     required String kioskCode,
@@ -113,6 +145,7 @@ class EventThemeStationJob {
       id: id,
       sessionId: sessionId,
       status: status,
+      times: times,
       previewUrls: [
         for (final url in previewUrls)
           stampEventStationImageUrl(
@@ -133,6 +166,7 @@ class EventPrintStationJob {
   final String printSize;
   final String status;
   final bool canReissue;
+  final EventStationJobTimes times;
 
   const EventPrintStationJob({
     required this.id,
@@ -141,6 +175,7 @@ class EventPrintStationJob {
     this.printSize = 's4x6',
     this.status = 'PENDING',
     this.canReissue = false,
+    this.times = const EventStationJobTimes(),
   });
 
   factory EventPrintStationJob.fromJson(Map<String, dynamic> json) {
@@ -148,6 +183,7 @@ class EventPrintStationJob {
     final src = nested is Map
         ? Map<String, dynamic>.from(nested)
         : json;
+    final merged = {...src, ...json};
     final size = (src['printSize'] ?? json['printSize'] ?? 's4x6').toString();
     final raw = (src['rawStatus'] ?? src['status'] ?? json['status'] ?? '').toString();
     final status = _bucketStatus(src['status'] ?? json['status'] ?? raw);
@@ -162,6 +198,7 @@ class EventPrintStationJob {
           raw.toUpperCase() == 'FAILED' ||
           status == 'DONE' ||
           status == 'CLAIMED',
+      times: EventStationJobTimes.fromJson(merged),
     );
   }
 
@@ -183,18 +220,21 @@ class EventPrintStationJob {
       printSize: printSize,
       status: status,
       canReissue: canReissue,
+      times: times,
     );
   }
 }
 
 class EventStationBoard {
   final EventStationStats stats;
+  final EventDeliveryStats delivery;
   final List<EventCaptureStationItem> captures;
   final List<EventThemeStationJob> themeJobs;
   final List<EventPrintStationJob> printJobs;
 
   const EventStationBoard({
     this.stats = const EventStationStats(),
+    this.delivery = const EventDeliveryStats(),
     this.captures = const [],
     this.themeJobs = const [],
     this.printJobs = const [],
@@ -204,10 +244,12 @@ class EventStationBoard {
     if (data is! Map) return const EventStationBoard();
     final map = Map<String, dynamic>.from(data);
     final statsRaw = map['stats'];
+    final statsMap = statsRaw is Map
+        ? Map<String, dynamic>.from(statsRaw)
+        : <String, dynamic>{};
     return EventStationBoard(
-      stats: statsRaw is Map
-          ? EventStationStats.fromJson(Map<String, dynamic>.from(statsRaw))
-          : const EventStationStats(),
+      stats: EventStationStats.fromJson(statsMap),
+      delivery: EventDeliveryStats.fromJson(statsMap),
       captures: _mapList(map['captures'], EventCaptureStationItem.fromJson)
           .where((e) => e.isValid)
           .toList(),
@@ -222,6 +264,7 @@ class EventStationBoard {
   }) {
     return EventStationBoard(
       stats: stats,
+      delivery: delivery,
       captures: [
         for (final item in captures)
           item.withStationImageAuth(kioskCode: kioskCode, eventCode: eventCode),
@@ -261,6 +304,7 @@ List<T> itemsForStationStatus<T>(
   String Function(T item) readStatus,
 ) {
   final wanted = status.trim().toUpperCase();
+  if (wanted.isEmpty || wanted == 'ALL') return List<T>.from(items);
   return items.where((item) => readStatus(item).toUpperCase() == wanted).toList();
 }
 

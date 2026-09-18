@@ -10,6 +10,7 @@ import 'package:camera/camera.dart';
 import 'package:camera_native_details/camera_native_details.dart';
 import 'package:uvccamera/uvccamera.dart';
 import 'photo_capture_camera_picker_screen.dart';
+import 'photo_capture_countdown_overlay.dart';
 import 'photo_capture_pose_setup_helpers.dart';
 import 'photo_capture_preview_rotation.dart';
 import 'photo_capture_camera_error_helpers.dart';
@@ -216,7 +217,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
     _syncCaptureWatchdog(_captureViewModel);
     // Classic 1-shot is a linear FSM — never drive it from VM notify storms
     // (UVC normalize / reopen was restarting countdowns forever).
-    if (widget.sessionKind.isClassicFourShot) {
+    if (widget.sessionKind.isClassicMultiShot) {
       _maybeAdvanceFlashbackAutoChain();
     } else if (widget.sessionKind.isClassicOneShot) {
       _oneShotOnViewModelTick();
@@ -262,15 +263,37 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
     _captureViewModel.forceAbortCapture();
     _captureViewModel.cancelCountdown();
     _flashbackCountdownStarting = false;
-    _clearUvcTransientCaptureUi();
+    // Must re-arm Canon LV — leaving still-arm down makes the next Take shot
+    // hang on "Hold still…" again.
+    _clearUvcTransientCaptureUi(releaseSidecarArm: true);
     if (_uvcPhase == UvcFeedPhase.capturing) {
       _uvcPhase = UvcFeedPhase.error;
     }
     setState(() {
-      _uvcError ??=
-          'Capture took too long. Tap Capture to retry or use Gallery.';
+      _uvcError ??= AppStrings.captureWatchdogAbort;
     });
     if (mounted) _maybeAdvanceFlashbackAutoChain();
+  }
+
+  /// Guest cancels a stuck sidecar prepare / Hold-still banner.
+  void _cancelStuckStillPrep() {
+    if (!mounted) return;
+    AppLogger.warning('[HDMI_POSE] Guest cancelled stuck still prep');
+    unawaited(
+      _captureViewModel.localCameraService?.postClientEvent(
+        'prep_arm_guest_cancel',
+        {'corrId': _poseCorrId},
+      ),
+    );
+    _captureViewModel.forceAbortCapture();
+    _captureViewModel.cancelCountdown();
+    _flashbackCountdownStarting = false;
+    _clearUvcTransientCaptureUi(releaseSidecarArm: true);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text(AppStrings.captureMaskStallRetry)),
+    );
+    setState(() {});
   }
 
   void _armMaskStallSoftFailTimer() {
@@ -351,7 +374,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
   void _maybeAdvanceFlashbackAutoChain() {
     if (!mounted) return;
     // 1-shot never enters this chain — see [_oneShotDispatch].
-    if (!widget.sessionKind.isClassicFourShot) return;
+    if (!widget.sessionKind.isClassicMultiShot) return;
     // Accept has detached the still but not finished retake/resume yet.
     if (_flashbackAcceptingShot) return;
 
@@ -721,7 +744,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
 
   Future<void> _startFlashbackAutoCountdown() async {
     // Classic 1-shot uses [_oneShotDispatch] only — never share this path.
-    if (!widget.sessionKind.isClassicFourShot) return;
+    if (!widget.sessionKind.isClassicMultiShot) return;
     if (_flashbackCountdownStarting || !mounted) return;
     if (!shouldAutoStartFlashbackCountdown(
       isFlashbackMultiShot: true,
@@ -923,14 +946,15 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
   /// Classic POSE (1-shot or 4-shot). Prefer this over [_isFlashbackMultiShot].
   bool get _isClassicPose => widget.sessionKind.isClassic;
 
-  /// Classic 4-shot strip only — never true for 1-shot (avoids remount chain).
-  bool get _isFlashbackMultiShot => widget.sessionKind.isClassicFourShot;
+  /// Classic multi-shot strip (3 or 4) — never true for 1-shot (avoids remount chain).
+  bool get _isFlashbackMultiShot => widget.sessionKind.isClassicMultiShot;
 
-  bool get _isFlashbackFourShot => widget.sessionKind.isClassicFourShot;
+  /// Any Classic 2×6 strip session (3- or 4-shot) — not the 1-shot FSM.
+  bool get _isFlashbackStripSession => widget.sessionKind.isClassicStrip;
 
   bool get _keepUvcOpenForSession =>
       UvcCaptureConfig.shouldKeepUvcControllerOpen(
-        classicFourShotSession: _isFlashbackFourShot,
+        classicStripSession: _isFlashbackStripSession,
       );
 
   /// Classic prefers HDMI/UVC; fallback uses Pi MJPEG when HDMI open fails.
@@ -966,6 +990,13 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
   bool get _isFlashbackSingleShot => widget.sessionKind.isClassicOneShot;
 
   int get _classicShotCap => widget.sessionKind.classicShotCount ?? 0;
+
+  /// Strip length for progress UI — session kind first, route args as backup.
+  int get _stripTotal {
+    final cap = _classicShotCap;
+    if (cap > 0) return cap;
+    return _multiShotTotal ?? kStripShotCount;
+  }
 
   void _syncClassicPoseFieldsFromKind() {
     final mode = widget.sessionKind.classicShotMode;
@@ -1118,7 +1149,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
       return null;
     }
     final countdownSeconds = captureCountdownSecondsForMode(
-      isFlashbackMultiShot: _isFlashbackFourShot || _isFlashbackSingleShot,
+      isFlashbackMultiShot: _isFlashbackStripSession || _isFlashbackSingleShot,
       acceptedShotCount: _stripShots.length,
     );
     final prepareAt = flashbackSidecarStillPrepareAtSecond(
@@ -1257,8 +1288,10 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
       _multiShotTotal = 1;
       final counting = _captureViewModel.isCountingDown;
       _subtitleHint = counting
-          ? AppStrings.flashbackPoseProgressSingle
-          : AppStrings.flashbackCaptureSubtitleSingle;
+          ? AppStrings.flashbackPoseProgressSingleFor(
+              captureCountdownSecondsForMode(isFlashbackMultiShot: true),
+            )
+          : classicPoseSubtitle(ClassicShotMode.single6x4);
       return;
     }
     final total = _classicShotCap;
@@ -1279,7 +1312,9 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
     } else if (_stripShots.isNotEmpty && next <= total) {
       _subtitleHint = AppStrings.flashbackGetReadyForShot(next, total);
     } else {
-      _subtitleHint = AppStrings.flashbackCaptureSubtitle;
+      _subtitleHint = total == 3
+          ? classicPoseSubtitle(ClassicShotMode.threeShot)
+          : classicPoseSubtitle(ClassicShotMode.fourShot);
     }
   }
 
@@ -1304,7 +1339,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
     }
 
     final theme = _flashbackTheme ?? ClassicCaptureIntent.peekTheme();
-    if (!widget.sessionKind.isClassicFourShot) return;
+    if (!widget.sessionKind.isClassicMultiShot) return;
     if (theme == null) return;
     final total = _classicShotCap;
     if (total <= 0) return;
@@ -1538,7 +1573,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
         return;
       }
 
-      final shotOk = dataUrls.length == kStripShotCount;
+      final shotOk = dataUrls.length == _classicShotCap;
       if (!shotOk || dataUrls.any((u) => u.trim().isEmpty)) {
         _clearStripFinishingFlags(notify: true);
         if (mounted) {
@@ -1559,7 +1594,8 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
         imageDataUrls: dataUrls,
         overlayCleanupAlreadyDone: allScrubbed,
         shotCleaned: shotCleaned,
-        classicShotMode: ClassicShotMode.fourShot,
+        classicShotMode:
+            widget.sessionKind.classicShotMode ?? ClassicShotMode.fourShot,
       );
       // Direct page route — named `routes:` → const FotoFlashbackFilterScreen()
       // drops typed args on Android TV (forever spinner on Pick a look).
@@ -1818,7 +1854,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
       setState(() {});
       _resetUvcIdleSleepTimer();
       // 4-shot only — 1-shot must not auto-fire after USB webcam reopen.
-      if (widget.sessionKind.isClassicFourShot) {
+      if (widget.sessionKind.isClassicMultiShot) {
         _maybeAdvanceFlashbackAutoChain();
       }
     });
@@ -2174,7 +2210,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
     );
     unawaited(_captureViewModel.loadPreviewRotation());
     _syncPoseIdleTimer(_captureViewModel);
-    if (widget.sessionKind.isClassicFourShot) {
+    if (widget.sessionKind.isClassicMultiShot) {
       _maybeAdvanceFlashbackAutoChain();
     } else if (widget.sessionKind.isClassicOneShot) {
       _oneShotOnViewModelTick();
@@ -2233,7 +2269,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
       unawaited(_beginPoseCaptureSetup());
     }
 
-    if (_isFlashbackFourShot && _stripShots.isNotEmpty) {
+    if (_isFlashbackStripSession && _stripShots.isNotEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) => beginSetupOnce());
       return;
     }
@@ -3290,7 +3326,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
       }
       return;
     }
-    final flashback = _isFlashbackFourShot;
+    final flashback = _isFlashbackStripSession;
     // Web: remount capture route so getUserMedia restarts (same State leaves a
     // black / dead stream after takePicture). Strip progress is carried in args.
     // Native/UVC: stay on this State and force a controller re-init.
@@ -3353,7 +3389,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
 
     final ctrl = _uvcController;
     if (UvcCaptureConfig.shouldKeepUvcControllerOpen(
-          classicFourShotSession: _isFlashbackFourShot,
+          classicStripSession: _isFlashbackStripSession,
         ) &&
         ctrl != null &&
         ctrl.value.isInitialized) {
@@ -3415,7 +3451,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
     try {
       await _withUvcLock(_closeUvcControllerUnlocked);
       if (!UvcCaptureConfig.shouldKeepUvcControllerOpen(
-        classicFourShotSession: _isFlashbackFourShot,
+        classicStripSession: _isFlashbackStripSession,
       )) {
         PaintingBinding.instance.imageCache.clear();
         PaintingBinding.instance.imageCache.clearLiveImages();
@@ -4189,7 +4225,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
     // First HDMI frames after open are often the body info screen until LV
     // settles — mask until warmup ends.
     if (_uvcPreviewWarmupActive && viewModel.capturedPhoto == null) {
-      final midStrip = _isFlashbackFourShot && _stripShots.isNotEmpty;
+      final midStrip = _isFlashbackStripSession && _stripShots.isNotEmpty;
       return _uvcStartingLiveViewCard(
         message: midStrip ? _classicMidStripReadyMessage() : null,
       );
@@ -4565,7 +4601,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
         // review JPEG is assigned — closing first caused a long blank gap
         // (dispose + 750ms delay + Connecting flash).
         if (!UvcCaptureConfig.shouldKeepUvcControllerOpen(
-              classicFourShotSession: _isFlashbackFourShot,
+              classicStripSession: _isFlashbackStripSession,
             ) &&
             !fromSidecar) {
           _detachUvcHardwareListeners();
@@ -4596,7 +4632,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
         } else if (captureFailed) {
           final keepOpen = preferSidecar ||
               UvcCaptureConfig.shouldKeepUvcControllerOpen(
-                classicFourShotSession: _isFlashbackFourShot,
+                classicStripSession: _isFlashbackStripSession,
               );
           if (!keepOpen) {
             _detachUvcHardwareListeners();
@@ -4667,7 +4703,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
       });
     } finally {
       if (!UvcCaptureConfig.shouldKeepUvcControllerOpen(
-            classicFourShotSession: _isFlashbackFourShot,
+            classicStripSession: _isFlashbackStripSession,
           ) &&
           fromSidecar) {
         _detachUvcHardwareListeners();
@@ -4700,7 +4736,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
         (m) => m.settings?.photoUploadAllowed == true,
       ),
       classicFourShotInProgress:
-          _isFlashbackFourShot && _stripShots.isNotEmpty,
+          _isFlashbackStripSession && _stripShots.isNotEmpty,
     );
     return Center(
       child: Padding(
@@ -4786,7 +4822,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
     if (_awaitingCanonUsbPermission) {
       return AppStrings.captureWaitingCanonUsbPermission;
     }
-    if (_isFlashbackFourShot && _stripShots.isNotEmpty) {
+    if (_isFlashbackStripSession && _stripShots.isNotEmpty) {
       final total = _classicShotCap > 0 ? _classicShotCap : 1;
       final next = (_stripShots.length + 1).clamp(1, total);
       return AppStrings.flashbackGetReadyForShot(next, total);
@@ -4852,7 +4888,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
         (m) => m.settings?.photoUploadAllowed == true,
       ),
       classicFourShotInProgress:
-          _isFlashbackFourShot && _stripShots.isNotEmpty,
+          _isFlashbackStripSession && _stripShots.isNotEmpty,
     );
     return Center(
       child: Padding(
@@ -4936,7 +4972,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
             (m) => m.settings?.photoUploadAllowed == true,
           ),
           classicFourShotInProgress:
-              _isFlashbackFourShot && _stripShots.isNotEmpty,
+              _isFlashbackStripSession && _stripShots.isNotEmpty,
         );
         return PhotoCaptureDesktopBody(
           viewModel: viewModel,
@@ -4978,7 +5014,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
     );
 
     final midStripRemount =
-        _isFlashbackFourShot && _stripShots.isNotEmpty;
+        _isFlashbackStripSession && _stripShots.isNotEmpty;
     final Widget body;
     final String phaseKey;
     switch (phase) {
@@ -5081,11 +5117,11 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
                   viewModel: viewModel,
                   subtitleHint: _subtitleHint,
                   stripShotTotal:
-                      _isFlashbackFourShot ? _multiShotTotal : null,
-                  stripShotFiles: _isFlashbackFourShot
+                      _isFlashbackStripSession ? _stripTotal : null,
+                  stripShotFiles: _isFlashbackStripSession
                       ? _stripShots.map((p) => p.imageFile).toList(growable: false)
                       : const [],
-                  stripPendingFile: _isFlashbackFourShot
+                  stripPendingFile: _isFlashbackStripSession
                       ? viewModel.capturedPhoto?.imageFile
                       : null,
                   onBack: () => unawaited(_handleCaptureBack(context)),
@@ -5320,7 +5356,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
                     ),
                   if (viewModel.isCountingDown)
                     Positioned.fill(
-                      child: _buildCountdownOverlay(context, viewModel.countdownValue!),
+                      child: _buildCountdownOverlay(viewModel.countdownValue!),
                     ),
                   if (!hasCapturedPhoto &&
                       shouldShowSidecarPrepHoldBanner(
@@ -5338,26 +5374,39 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
                       child: Material(
                         color: Colors.black.withValues(alpha: 0.55),
                         borderRadius: BorderRadius.circular(10),
-                        child: const Padding(
-                          padding: EdgeInsets.symmetric(
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
                             horizontal: 14,
                             vertical: 10,
                           ),
-                          child: Text(
-                            AppStrings.captureHoldStillFocusing,
-                            textAlign: TextAlign.center,
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 16,
-                              fontWeight: FontWeight.w600,
-                            ),
+                          child: Row(
+                            children: [
+                              const Expanded(
+                                child: Text(
+                                  AppStrings.captureHoldStillFocusing,
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                              TextButton(
+                                onPressed: _cancelStuckStillPrep,
+                                child: const Text(
+                                  AppStrings.captureCancelHoldStill,
+                                  style: TextStyle(color: Colors.white),
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                       ),
                     ),
                   if (!hasCapturedPhoto &&
                       shouldShowClassicBetweenShotReadyBanner(
-                        isFourShot: _isFlashbackFourShot,
+                        isStripSession: _isFlashbackStripSession,
                         acceptedCount: _stripShots.length,
                         total: _classicShotCap,
                         hasCapturedPhoto: hasCapturedPhoto,
@@ -5387,11 +5436,10 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
                           'review-hold-${_flashbackReviewPhotoId ?? _flashbackReviewEndsAt!.millisecondsSinceEpoch}',
                         ),
                         endsAt: _flashbackReviewEndsAt!,
-                        isLastShot: (_stripShots.length + 1) >=
-                            (_multiShotTotal ?? kStripShotCount),
-                        nextShot: ((_stripShots.length + 2)
-                            .clamp(1, _multiShotTotal ?? kStripShotCount)),
-                        total: _multiShotTotal ?? kStripShotCount,
+                        isLastShot: (_stripShots.length + 1) >= _stripTotal,
+                        nextShot:
+                            (_stripShots.length + 2).clamp(1, _stripTotal),
+                        total: _stripTotal,
                       ),
                     ),
                   // Plain UVC/CameraX stills may dim the preview. Sidecar DSLR
@@ -5585,70 +5633,22 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
     );
   }
 
-  /// Builds the on-screen capture countdown overlay (e.g. 10, 9, 8…).
-  Widget _buildCountdownOverlay(BuildContext context, int countdownValue) {
+  /// Pose timer at the top of the preview — not centred over faces.
+  Widget _buildCountdownOverlay(int countdownValue) {
     // Classic shot progress already appears in the app-bar subtitle — avoid
     // repeating "Pose now — Shot X of Y" inside the preview card.
     final showAiIntro = !_isClassicPose &&
         countdownValue == AppConstants.kCaptureCountdownSeconds;
-    final String? headline =
-        showAiIntro ? AppStrings.captureCountdownIntro : null;
-
-    return Container(
-      color: Colors.black.withValues(alpha: 0.5),
-      child: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (headline != null) ...[
-              Text(
-                headline,
-                style: TextStyle(
-                  fontSize: 22,
-                  fontWeight: FontWeight.w700,
-                  color: Colors.white.withValues(alpha: 0.95),
-                ),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 20),
-            ],
-            Container(
-              width: 150,
-              height: 150,
-              decoration: BoxDecoration(
-                color: Colors.grey.withValues(alpha: 0.7),
-                shape: BoxShape.circle,
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.3),
-                    blurRadius: 30,
-                    spreadRadius: 10,
-                  ),
-                ],
-              ),
-              child: Center(
-                child: Text(
-                  '$countdownValue',
-                  style: const TextStyle(
-                    fontSize: 80,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.white,
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
+    return CaptureCountdownOverlay(
+      countdownValue: countdownValue,
+      headline: showAiIntro ? AppStrings.captureCountdownIntro : null,
     );
   }
 
   /// Retake and Continue buttons in a Row (post-capture).
   Widget _buildCapturedPhotoControlsRow(BuildContext context, CaptureViewModel viewModel) {
     final multi = _isClassicPose;
-    final total = _isFlashbackSingleShot
-        ? 1
-        : (_classicShotCap > 0 ? _classicShotCap : kStripShotCount);
+    final total = _isFlashbackSingleShot ? 1 : _stripTotal;
     final isLastStripShot = multi && (_stripShots.length + 1) >= total;
     final continueLabel = !multi
         ? (viewModel.isPreparingUploadPayload ? 'Preparing…' : 'Continue')
@@ -5669,7 +5669,7 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
                     unawaited(_handleRetake(context));
                   },
             child: Text(
-              _isFlashbackFourShot
+              _isFlashbackStripSession
                   ? AppStrings.flashbackRetakeLast
                   : 'Retake',
             ),
@@ -5758,12 +5758,12 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
             settingsManager.settings?.photoUploadAllowed == true,
       ),
       classicFourShotInProgress:
-          _isFlashbackFourShot && _stripShots.isNotEmpty,
+          _isFlashbackStripSession && _stripShots.isNotEmpty,
     );
     final flashback = _isFlashbackMultiShot || _isFlashbackSingleShot;
     final countdownSecs = captureCountdownSecondsForMode(
       isFlashbackMultiShot: flashback,
-      acceptedShotCount: _isFlashbackFourShot ? _stripShots.length : 0,
+      acceptedShotCount: _isFlashbackStripSession ? _stripShots.length : 0,
     );
 
     return SizedBox(
@@ -5844,6 +5844,10 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
             style: captureScreenButtonStyle(),
             onPressed: (viewModel.isCapturing ||
                     _uvcCaptureInFlight ||
+                    captureStillPrepBlocksShutter(
+                      sidecarStillPrepStarted: _sidecarStillPrepStarted,
+                      hdmiStillMaskArmed: _uvcHdmiStillMaskArmed,
+                    ) ||
                     viewModel.isSelectingFromGallery ||
                     viewModel.isCountingDown ||
                     _flashbackCountdownStarting ||
@@ -5888,9 +5892,12 @@ class _PhotoCaptureScreenState extends State<PhotoCaptureScreen>
                   },
             icon: const Icon(CupertinoIcons.camera, size: 20),
             label: Text(
-              (viewModel.isCapturing ||
-                      _uvcCaptureInFlight ||
-                      _uvcHdmiStillMaskArmed)
+              captureShowsStillInProgressLabel(
+                    isCapturing: viewModel.isCapturing,
+                    captureInFlight: _uvcCaptureInFlight,
+                    hdmiStillMaskArmed: _uvcHdmiStillMaskArmed,
+                    sidecarStillPrepStarted: _sidecarStillPrepStarted,
+                  )
                   ? _stillInProgressLabel(viewModel)
                   : (flashback
                       ? AppStrings.flashbackTakeShot

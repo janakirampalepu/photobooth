@@ -10,8 +10,27 @@ const String kDefaultStripFrameId = 'classic';
 /// Default sticker pack when the API omits / invalidates [sticker].
 const String kDefaultStripStickerId = 'none';
 
-/// Exact shot count required by `POST /api/sessions/:id/strip/compose`.
+/// Default (and maximum) strip length for `POST /api/sessions/:id/strip/compose`.
 const int kStripShotCount = 4;
+
+/// Shorter 2×6 strip: three poses instead of four (same fixed print size).
+const int kStripShotCountThree = 3;
+
+/// Strip lengths a Classic multi-shot session may run.
+const List<int> kClassicStripShotCounts = <int>[
+  kStripShotCountThree,
+  kStripShotCount,
+];
+
+/// Hairline matte for Classic / Noir 1-shot (preview + local print).
+const double kClassicSingleMatteRatio = 0.027;
+
+/// Filmstrip 1-shot rail (matches [StripChromeLook.filmRailRatio] 36/600).
+const double kClassicFilmstripRailRatio = 36 / 600;
+
+/// Shot counts `/strip/compose` accepts: 1 (6×4 / 4×6) or a 2×6 strip length.
+bool isValidClassicComposeShotCount(int count) =>
+    count == 1 || kClassicStripShotCounts.contains(count);
 
 /// Catalog order from zenai `STRIP_FILTER_IDS` / `GET /api/strip/filters`.
 const List<String> kStripFilterIds = [
@@ -47,8 +66,204 @@ const List<String> kStripSheetLayoutIds = [
 bool isStripSheetLayout(String frameId) =>
     kStripSheetLayoutIds.contains(frameId);
 
-/// Admin scrapbook templates use catalog ids `st:<uuid>`.
-bool isStripTemplateFrame(String frameId) => frameId.startsWith('st:');
+/// Admin scrapbook templates (`st:`), occasion 4-shot 6×2 (`fr:`), 3-shot (`f3:`).
+bool isStripTemplateFrame(String frameId) =>
+    frameId.startsWith('st:') ||
+    frameId.startsWith('fr:') ||
+    frameId.startsWith('f3:');
+
+/// Occasion-frame Classic 1-shot using the same AI overlay PNG (`ai:`).
+bool isOccasionFrameId(String frameId) =>
+    frameId.startsWith('ai:') && frameId.length > 3;
+
+/// Classic 3-shot 6×2 occasion variant (`f3:`).
+bool isStrip3TemplateFrame(String frameId) =>
+    frameId.startsWith('f3:') && frameId.length > 3;
+
+/// Occasion-frame Classic 4-shot 6×2 variant (`fr:`).
+bool isFrameStripVariantId(String frameId) =>
+    frameId.startsWith('fr:') && frameId.length > 3;
+
+/// Database uuid from `ai:` / `f3:` / `fr:` / `st:` catalog ids.
+String? classicFrameDbId(String frameId) {
+  if (frameId.length <= 3) return null;
+  if (isOccasionFrameId(frameId) ||
+      isStrip3TemplateFrame(frameId) ||
+      isFrameStripVariantId(frameId) ||
+      frameId.startsWith('st:')) {
+    return frameId.substring(3);
+  }
+  return null;
+}
+
+/// Normalized photo window on a 600×1800 Classic 6×2 overlay.
+class StripTemplateSlot {
+  const StripTemplateSlot({
+    required this.left,
+    required this.top,
+    required this.width,
+    required this.height,
+    this.rotDeg = 0,
+  });
+
+  final double left;
+  final double top;
+  final double width;
+  final double height;
+  final double rotDeg;
+
+  static StripTemplateSlot? tryParse(dynamic raw) {
+    if (raw is! Map) return null;
+    final map = Map<dynamic, dynamic>.from(raw);
+    double? numOrNull(dynamic value) =>
+        value is num ? value.toDouble() : null;
+    final left = numOrNull(map['left']);
+    final top = numOrNull(map['top']);
+    final width = numOrNull(map['width']);
+    final height = numOrNull(map['height']);
+    if (left == null || top == null || width == null || height == null) {
+      return null;
+    }
+    if (width < 0.08 || height < 0.08) return null;
+    final rot = numOrNull(map['rotDeg']) ?? 0;
+    return StripTemplateSlot(
+      left: left.clamp(0.0, 1.0),
+      top: top.clamp(0.0, 1.0),
+      width: width.clamp(0.08, 1.0),
+      height: height.clamp(0.08, 1.0),
+      rotDeg: rot.clamp(-25.0, 25.0),
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'left': left,
+        'top': top,
+        'width': width,
+        'height': height,
+        if (rotDeg != 0) 'rotDeg': rotDeg,
+      };
+}
+
+/// Catalog `slots` for a 6×2 overlay; empty when missing or malformed.
+List<StripTemplateSlot> parseStripTemplateSlots(dynamic raw) {
+  if (raw is! List) return const [];
+  final out = <StripTemplateSlot>[];
+  for (final item in raw) {
+    final slot = StripTemplateSlot.tryParse(item);
+    if (slot == null) return const [];
+    out.add(slot);
+  }
+  return out;
+}
+
+/// Header/footer room for branded 6×2 occasion overlays (matches zenai).
+List<StripTemplateSlot> defaultOccasionStripSlots(int shotCount) {
+  const left = 0.08;
+  const width = 0.84;
+  if (shotCount == kStripShotCountThree) {
+    return const [
+      StripTemplateSlot(left: left, top: 0.16, width: width, height: 0.21),
+      StripTemplateSlot(left: left, top: 0.385, width: width, height: 0.21),
+      StripTemplateSlot(left: left, top: 0.61, width: width, height: 0.21),
+    ];
+  }
+  return const [
+    StripTemplateSlot(left: left, top: 0.16, width: width, height: 0.155),
+    StripTemplateSlot(left: left, top: 0.325, width: width, height: 0.155),
+    StripTemplateSlot(left: left, top: 0.49, width: width, height: 0.155),
+    StripTemplateSlot(left: left, top: 0.655, width: width, height: 0.155),
+  ];
+}
+
+/// Fallback 4×6 photo window when the catalog omits the overlay hole.
+const StripTemplateSlot defaultOccasionSinglePhotoHole = StripTemplateSlot(
+  left: 0.075,
+  top: 0.175,
+  width: 0.85,
+  height: 0.60,
+);
+
+/// Fallback 6×4 window when an occasion overlay has no landscape hole.
+const StripTemplateSlot defaultClassicLandscapePhotoHole = StripTemplateSlot(
+  left: 0.07,
+  top: 0.14,
+  width: 0.86,
+  height: 0.72,
+);
+
+/// Built-in Classic / Noir / Filmstrip 1-shot: thin chrome, full capture inside.
+StripTemplateSlot classicChromeSinglePhotoHole({String frameId = 'classic'}) {
+  final x = frameId == 'filmstrip'
+      ? kClassicFilmstripRailRatio
+      : kClassicSingleMatteRatio;
+  const y = kClassicSingleMatteRatio;
+  return StripTemplateSlot(
+    left: x,
+    top: y,
+    width: 1 - 2 * x,
+    height: 1 - 2 * y,
+  );
+}
+
+/// Catalog hole for Classic 1-shot occasion overlay, else orientation default.
+StripTemplateSlot occasionSinglePhotoHole(
+  List<StripTemplateSlot> slots, {
+  bool landscape = false,
+}) {
+  if (slots.length == 1) return slots.first;
+  return landscape
+      ? defaultClassicLandscapePhotoHole
+      : defaultOccasionSinglePhotoHole;
+}
+
+/// Built-in 1-shot window (same thin chrome on 4×6 and 6×4).
+StripTemplateSlot? classicBuiltInSinglePhotoHole({
+  required bool landscape,
+  String frameId = 'classic',
+}) {
+  return classicChromeSinglePhotoHole(frameId: frameId);
+}
+
+/// Photo window for Classic 1-shot preview/print (occasion hole or built-in matte).
+StripTemplateSlot resolveClassicSinglePhotoHole({
+  required bool hasOverlay,
+  required bool landscape,
+  StripTemplateSlot? overlayHole,
+  String frameId = 'classic',
+}) {
+  if (hasOverlay) {
+    return overlayHole ??
+        occasionSinglePhotoHole(const [], landscape: landscape);
+  }
+  return classicChromeSinglePhotoHole(frameId: frameId);
+}
+
+/// Portrait 4×6 overlay, or the dedicated 6×4 PNG when [landscape] is true.
+String? classicOccasionOverlayUrl({
+  required String? overlayUrl,
+  String? landscapeOverlayUrl,
+  required bool landscape,
+}) {
+  final land = (landscapeOverlayUrl ?? '').trim();
+  if (landscape && land.isNotEmpty) return land;
+  final portrait = (overlayUrl ?? '').trim();
+  return portrait.isEmpty ? null : portrait;
+}
+
+/// Photo window for the overlay returned by [classicOccasionOverlayUrl].
+List<StripTemplateSlot> classicOccasionOverlaySlots({
+  required List<StripTemplateSlot> slots,
+  List<StripTemplateSlot> landscapeSlots = const [],
+  required bool landscape,
+  required bool hasLandscapeOverlay,
+}) {
+  if (landscape && hasLandscapeOverlay) {
+    return landscapeSlots.length == 1
+        ? landscapeSlots
+        : const [defaultClassicLandscapePhotoHole];
+  }
+  return slots;
+}
 
 const List<String> kStripStickerIds = [
   'none',
@@ -161,12 +376,36 @@ class StripStickerPlacement {
       };
 }
 
-/// Per-frame print cell aspect (width ÷ height) for a 2×6 strip.
+/// Printed 2×6 strip geometry at 300 DPI. Fixed — never varies by shot count.
+const double kStripPrintWidthPx = 600;
+const double kStripPrintHeightPx = 1800;
+
+/// HAMA-style equal margin on each edge (and between cells as gutters).
+const double kStripPrintBorderPx = 10;
+const double kStripPrintGutterPx = 10;
+
+/// Per-frame print cell aspect (width ÷ height) for a 4-shot 2×6 strip.
 ///
 /// Matches zenai `stripCompositor` cellGeometry at 300 DPI:
-/// strip 600×1800, border 4, gutter 0 → cell 592×448 (landscape).
+/// strip 600×1800, equal 10px margins + 10px gutters → cell 580×437.5.
 /// Shots are cover-cropped edge-to-edge (no blur/letterbox fill).
-const double kStripCellAspectRatio = 592 / 448;
+const double kStripCellAspectRatio = 580 / 437.5;
+
+/// Cell aspect (width ÷ height) for a [shotCount]-long 2×6 strip.
+///
+/// The sheet is fixed, so fewer shots means taller cells:
+/// 4 → 580×437.5, 3 → 580×(1760/3). Capture framing, look-picker
+/// preview and print all read this so the guest sees what gets printed.
+double stripCellAspectRatioForShots(int shotCount) {
+  final shots = shotCount <= 0 ? kStripShotCount : shotCount;
+  const inner = kStripPrintWidthPx - 2 * kStripPrintBorderPx;
+  final cellHeight =
+      (kStripPrintHeightPx -
+          2 * kStripPrintBorderPx -
+          (shots - 1) * kStripPrintGutterPx) /
+      shots;
+  return inner / cellHeight;
+}
 
 /// One look from `GET /api/strip/filters`.
 class StripFilter {
@@ -203,21 +442,34 @@ class StripFrame {
     required this.description,
     this.kind,
     this.overlayUrl,
+    this.landscapeOverlayUrl,
     this.caption,
     this.logoUrl,
+    this.shotCount,
+    this.slots = const [],
+    this.landscapeSlots = const [],
   });
 
   final String id;
   final String name;
   final String description;
 
-  /// `template` for admin scrapbook strips; null/builtin otherwise.
+  /// `template` for admin scrapbook strips; `occasion` for 1-shot AI overlay.
   final String? kind;
   final String? overlayUrl;
+  final String? landscapeOverlayUrl;
   final String? caption;
   final String? logoUrl;
 
+  /// `1` (6×4), `3` or `4` (6×2). Null for builtins shown on every shot count
+  /// except sheet layouts (those use [isStripSheetLayout]).
+  final int? shotCount;
+  final List<StripTemplateSlot> slots;
+  final List<StripTemplateSlot> landscapeSlots;
+
   bool get isTemplate => kind == 'template' || isStripTemplateFrame(id);
+
+  bool get isOccasion => kind == 'occasion' || isOccasionFrameId(id);
 
   factory StripFrame.fromJson(Map<String, dynamic> json) {
     return StripFrame(
@@ -226,10 +478,77 @@ class StripFrame {
       description: JsonParseHelpers.stringValue(json['description']),
       kind: JsonParseHelpers.stringOrNull(json['kind']),
       overlayUrl: JsonParseHelpers.stringOrNull(json['overlayUrl']),
+      landscapeOverlayUrl:
+          JsonParseHelpers.stringOrNull(json['landscapeOverlayUrl']),
       caption: JsonParseHelpers.stringOrNull(json['caption']),
       logoUrl: JsonParseHelpers.stringOrNull(json['logoUrl']),
+      shotCount: JsonParseHelpers.intOrNull(json['shotCount']),
+      slots: parseStripTemplateSlots(json['slots']),
+      landscapeSlots: parseStripTemplateSlots(json['landscapeSlots']),
     );
   }
+}
+
+/// Shot count this catalog frame is for, inferred from id when [StripFrame.shotCount]
+/// is omitted. Null means a builtin valid on every Classic shot count except
+/// sheet layouts (those always require four shots).
+int? classicFrameCatalogShotCount(StripFrame frame) {
+  if (frame.shotCount == 1 ||
+      frame.shotCount == kStripShotCountThree ||
+      frame.shotCount == kStripShotCount) {
+    return frame.shotCount;
+  }
+  if (isOccasionFrameId(frame.id)) return 1;
+  if (isStrip3TemplateFrame(frame.id)) return kStripShotCountThree;
+  if (isStripTemplateFrame(frame.id) || isStripSheetLayout(frame.id)) {
+    return kStripShotCount;
+  }
+  return null;
+}
+
+bool classicFrameIdVisibleForShotCount(String frameId, int shotCount) {
+  return classicFrameVisibleForShotCount(
+    StripFrame(id: frameId, name: frameId, description: ''),
+    shotCount,
+  );
+}
+
+bool classicFrameVisibleForShotCount(StripFrame frame, int shotCount) {
+  final catalog = classicFrameCatalogShotCount(frame);
+  if (catalog == null) return true;
+  return catalog == shotCount;
+}
+
+/// Occasion / 6×2 variant matching [shotCount], if the catalog includes one.
+String? preferredOccasionFrameId(Iterable<StripFrame> frames, int shotCount) {
+  for (final frame in frames) {
+    if (!classicFrameVisibleForShotCount(frame, shotCount)) continue;
+    if (shotCount == 1 && isOccasionFrameId(frame.id)) return frame.id;
+    if (shotCount == kStripShotCountThree && isStrip3TemplateFrame(frame.id)) {
+      return frame.id;
+    }
+    if (shotCount == kStripShotCount && isFrameStripVariantId(frame.id)) {
+      return frame.id;
+    }
+  }
+  return null;
+}
+
+/// Keep the current pick when it is still valid; otherwise first occasion
+/// variant for this shot count, else the first visible frame.
+String preferredClassicFrameId({
+  required Iterable<StripFrame> frames,
+  required int shotCount,
+  required String selectedId,
+}) {
+  final visible = frames
+      .where((f) => classicFrameVisibleForShotCount(f, shotCount))
+      .toList(growable: false);
+  if (visible.isEmpty) return selectedId;
+  final selectedOk = visible.any((f) => f.id == selectedId);
+  if (selectedOk && selectedId != kDefaultStripFrameId) return selectedId;
+  return preferredOccasionFrameId(visible, shotCount) ??
+      (selectedOk ? selectedId : visible.first.id);
 }
 
 /// Sticker pack option from `GET /api/strip/filters`.
@@ -273,6 +592,9 @@ List<T> _parseNamedList<T>(
 class StripWysiwygLayout {
   const StripWysiwygLayout({
     required this.borderRatio,
+    required this.borderTopRatio,
+    required this.borderBottomRatio,
+    required this.gutterRatio,
     required this.accentStrokeRatio,
     required this.noirAccentStrokeRatio,
     required this.noirInnerInsetRatio,
@@ -310,6 +632,9 @@ class StripWysiwygLayout {
   });
 
   final double borderRatio;
+  final double borderTopRatio;
+  final double borderBottomRatio;
+  final double gutterRatio;
   final double accentStrokeRatio;
   final double noirAccentStrokeRatio;
   final double noirInnerInsetRatio;
@@ -348,7 +673,10 @@ class StripWysiwygLayout {
 
   /// Matches zenai `STRIP_WYSIWYG_LAYOUT` when the API omits `layout`.
   static const StripWysiwygLayout defaults = StripWysiwygLayout(
-    borderRatio: 4 / 600,
+    borderRatio: 10 / 600,
+    borderTopRatio: 10 / 1800,
+    borderBottomRatio: 10 / 1800,
+    gutterRatio: 10 / 1800,
     accentStrokeRatio: 1.75 / 600,
     noirAccentStrokeRatio: 2.5 / 600,
     noirInnerInsetRatio: 5 / 600,
@@ -385,14 +713,14 @@ class StripWysiwygLayout {
     gridTitle: 'Together',
     gridSubtitle: 'Our favorite moments',
     // Sheet-normalized (1200-wide); dual-strip chrome uses StripChromeLook ratios.
-    filmRailW: 52 / 1200,
-    filmMarginY: 72 / 1800,
-    filmGutter: 14 / 1800,
+    filmRailW: 36 / 1200,
+    filmMarginY: 10 / 1800,
+    filmGutter: 10 / 1800,
     filmStripPadX: 150 / 1200,
-    filmHoleW: 26 / 1200,
-    filmHoleH: 34 / 1800,
-    filmHolePitch: 58 / 1800,
-    filmCellAspect: 496 / 448,
+    filmHoleW: 18 / 1200,
+    filmHoleH: 24 / 1800,
+    filmHolePitch: 46 / 1800,
+    filmCellAspect: 528 / 437.5,
     filmLabel: 'MEMORIES',
   );
 
@@ -407,6 +735,10 @@ class StripWysiwygLayout {
     final film = _asMap(json['filmstrip']);
     return StripWysiwygLayout(
       borderRatio: _d(strip?['borderRatio'], defaults.borderRatio),
+      borderTopRatio: _d(strip?['borderTopRatio'], defaults.borderTopRatio),
+      borderBottomRatio:
+          _d(strip?['borderBottomRatio'], defaults.borderBottomRatio),
+      gutterRatio: _d(strip?['gutterRatio'], defaults.gutterRatio),
       accentStrokeRatio:
           _d(strip?['accentStrokeRatio'], defaults.accentStrokeRatio),
       noirAccentStrokeRatio:
@@ -583,6 +915,23 @@ class StripFiltersCatalog {
               false,
       enableOsdScrub:
           JsonParseHelpers.boolOrNull(featuresMap?['enableOsdScrub']) ?? false,
+    );
+  }
+
+  /// Same catalog with a different [frames] list (offline kiosk-frame merge).
+  StripFiltersCatalog withFrames(List<StripFrame> frames) {
+    return StripFiltersCatalog(
+      brand: brand,
+      shotCount: shotCount,
+      filters: filters,
+      frames: frames,
+      stickers: stickers,
+      printSize: printSize,
+      copiesOnSheet: copiesOnSheet,
+      printNote: printNote,
+      layout: layout,
+      enableSurpriseMeAi: enableSurpriseMeAi,
+      enableOsdScrub: enableOsdScrub,
     );
   }
 }

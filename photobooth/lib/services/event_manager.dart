@@ -1,23 +1,34 @@
+import 'dart:convert';
+
 import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
+import '../models/event_info_model.dart';
 import '../utils/event_station_role.dart';
+import 'catalog_disk_cache.dart';
 
 /// Cached booth event from `/api/event/verify` (additive to [KioskManager]).
 class EventManager {
+  EventManager({CatalogDiskCache? diskCache})
+      : _diskCache = diskCache ?? CatalogDiskCache();
+
+  final CatalogDiskCache _diskCache;
   static const String _kPrefsEventCode = 'event_code';
   static const String _kPrefsEventId = 'event_id';
   static const String _kPrefsEventPhotoMode = 'event_photo_mode';
   static const String _kPrefsEventThemeCount = 'event_theme_count';
   static const String _kPrefsEventFrameCount = 'event_frame_count';
   static const String _kPrefsEventName = 'event_name';
+  static const String _kPrefsEventJson = 'event_bound_json';
   static const String _kPrefsStationRole = 'event_station_role';
   static const String _kPrefsDeviceId = 'event_station_device_id';
 
   static String? _cachedCode;
   static String? _cachedPhotoMode;
   static String? _cachedStationRole;
+
+  String _diskKey(String code) => 'event_${code.trim().toUpperCase()}';
 
   @visibleForTesting
   static void resetCacheForTests() {
@@ -79,7 +90,8 @@ class EventManager {
       return _cachedStationRole!.isEmpty ? null : _cachedStationRole;
     }
     final prefs = await SharedPreferences.getInstance();
-    final parsed = EventStationRole.tryParse(prefs.getString(_kPrefsStationRole));
+    final parsed =
+        EventStationRole.tryParse(prefs.getString(_kPrefsStationRole));
     _cachedStationRole = parsed ?? '';
     return parsed;
   }
@@ -126,25 +138,76 @@ class EventManager {
     await prefs.setString(_kPrefsEventPhotoMode, trimmed);
   }
 
-  Future<void> cacheVerifyResult({
-    required String id,
-    required String code,
-    required String photoMode,
-    String? name,
-    int themeCount = 0,
-    int frameCount = 0,
-  }) async {
-    await setEventCode(code);
-    await setPhotoModeOverride(photoMode);
+  Future<void> cacheVerifyResult(EventInfoModel event) async {
+    await setEventCode(event.code);
+    await setPhotoModeOverride(event.photoMode);
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_kPrefsEventId, id);
-    if (name != null && name.trim().isNotEmpty) {
-      await prefs.setString(_kPrefsEventName, name.trim());
+    await prefs.setString(_kPrefsEventId, event.id);
+    final name = event.name?.trim() ?? '';
+    if (name.isNotEmpty) {
+      await prefs.setString(_kPrefsEventName, name);
     } else {
       await prefs.remove(_kPrefsEventName);
     }
-    await prefs.setInt(_kPrefsEventThemeCount, themeCount);
-    await prefs.setInt(_kPrefsEventFrameCount, frameCount);
+    await prefs.setInt(_kPrefsEventThemeCount, event.themeCount);
+    await prefs.setInt(_kPrefsEventFrameCount, event.frameCount);
+    final payload = event.toJson();
+    await prefs.setString(_kPrefsEventJson, jsonEncode(payload));
+    await _diskCache.writeJson(_diskKey(event.code), payload);
+  }
+
+  /// Returns the last verified row for this exact event code.
+  Future<EventInfoModel?> readCachedEvent(String code) async {
+    final fromDisk = EventInfoModel.fromCache(
+      await _diskCache.readJson(_diskKey(code)),
+      expectedCode: code,
+    );
+    if (fromDisk != null) return fromDisk;
+    return _readPrefsCachedEvent(code);
+  }
+
+  Future<EventInfoModel?> _readPrefsCachedEvent(String code) async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_kPrefsEventJson);
+    if (raw == null || raw.trim().isEmpty) return null;
+    try {
+      return EventInfoModel.fromCache(jsonDecode(raw), expectedCode: code);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<EventInfoModel?> readBoundEvent() async {
+    final code = await getEventCode();
+    if (code == null) return null;
+    return readCachedEvent(code);
+  }
+
+  /// Cache first, then an optional live fetch so web (no disk cache) can
+  /// still paint event chrome after a code-only bind.
+  Future<EventInfoModel?> hydrateBoundEvent({
+    Future<EventInfoModel?> Function(String code)? fetchLive,
+  }) async {
+    final cached = await readBoundEvent();
+    if (cached != null) return cached;
+    if (fetchLive == null) return null;
+    final code = await getEventCode();
+    if (code == null) return null;
+    return _fetchAndCacheBoundEvent(code, fetchLive);
+  }
+
+  Future<EventInfoModel?> _fetchAndCacheBoundEvent(
+    String code,
+    Future<EventInfoModel?> Function(String code) fetchLive,
+  ) async {
+    try {
+      final live = await fetchLive(code);
+      if (live == null || !live.isValid) return null;
+      await cacheVerifyResult(live);
+      return live;
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<void> clearEvent() async {
@@ -157,6 +220,7 @@ class EventManager {
     await prefs.remove(_kPrefsEventThemeCount);
     await prefs.remove(_kPrefsEventFrameCount);
     await prefs.remove(_kPrefsEventName);
+    await prefs.remove(_kPrefsEventJson);
     await prefs.remove(_kPrefsStationRole);
     _cachedStationRole = '';
   }

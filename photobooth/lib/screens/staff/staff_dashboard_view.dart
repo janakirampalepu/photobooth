@@ -55,6 +55,10 @@ class _StaffApiGateway implements StaffDashboardGateway {
       );
 
   @override
+  Future<void> updateOfflineCashPin(String pin) =>
+      _api.updateOfflineCashPin(pin);
+
+  @override
   Future<void> logout() => _api.logout();
 }
 
@@ -75,7 +79,10 @@ class _StaffDashboardScreenState extends State<StaffDashboardScreen>
   @override
   void initState() {
     super.initState();
-    _vm = StaffDashboardViewModel(gateway: _StaffApiGateway());
+    _vm = StaffDashboardViewModel(
+      gateway: _StaffApiGateway(),
+      seededSession: StaffOpsSessionHold.take(),
+    );
     _tabs = TabController(length: 2, vsync: this);
     _bootstrap();
   }
@@ -180,6 +187,8 @@ class _StaffDashboardScreenState extends State<StaffDashboardScreen>
                                     _showOpenRegisterDialog(context, vm),
                                 onCloseRegister: () =>
                                     _showCloseRegisterDialog(context, vm),
+                                onChangeOfflinePin: () =>
+                                    _showChangeOfflinePinDialog(context, vm),
                               ),
                               StaffPaymentsScreen(
                                 embedded: true,
@@ -310,6 +319,55 @@ class _StaffDashboardScreenState extends State<StaffDashboardScreen>
       closingNotes: notes.text.trim(),
     );
   }
+
+  Future<void> _showChangeOfflinePinDialog(
+    BuildContext context,
+    StaffDashboardViewModel vm,
+  ) async {
+    final controller = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text(AppStrings.staffChangeOfflinePinTitle),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Text(AppStrings.staffChangeOfflinePinBody),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              keyboardType: TextInputType.number,
+              obscureText: true,
+              maxLength: 8,
+              decoration: const InputDecoration(
+                labelText: AppStrings.staffChangeOfflinePinLabel,
+                counterText: '',
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text(AppStrings.cancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text(AppStrings.staffChangeOfflinePinConfirm),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final saved = await vm.updateOfflineCashPin(controller.text);
+    if (!context.mounted) return;
+    if (saved && vm.error == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text(AppStrings.staffChangeOfflinePinSaved)),
+      );
+    }
+  }
 }
 
 /// Overview tab content (KPIs, shift, register, performance).
@@ -318,10 +376,12 @@ class StaffDashboardOverviewTab extends StatelessWidget {
     super.key,
     required this.onOpenRegister,
     required this.onCloseRegister,
+    required this.onChangeOfflinePin,
   });
 
   final VoidCallback onOpenRegister;
   final VoidCallback onCloseRegister;
+  final VoidCallback onChangeOfflinePin;
 
   @override
   Widget build(BuildContext context) {
@@ -337,6 +397,9 @@ class StaffDashboardOverviewTab extends StatelessWidget {
           child: ListView(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
             children: [
+              const StaffOfflineModeBanner(),
+              const StaffDiskFullBanner(),
+              StaffLocalDayTotalsCard(isoDate: vm.selectedDate),
               if (vm.error != null) ...[
                 StaffDashboardErrorBanner(
                   message: vm.error!,
@@ -370,6 +433,12 @@ class StaffDashboardOverviewTab extends StatelessWidget {
                 busy: vm.actionBusy,
                 onOpen: onOpenRegister,
                 onClose: onCloseRegister,
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                onPressed: vm.actionBusy ? null : onChangeOfflinePin,
+                icon: const Icon(Icons.pin_outlined),
+                label: const Text(AppStrings.staffChangeOfflinePin),
               ),
               if (stats != null) ...[
                 const SizedBox(height: 12),

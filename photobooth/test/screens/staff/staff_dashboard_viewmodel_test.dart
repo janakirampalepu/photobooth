@@ -1,8 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:photobooth/models/staff_dashboard_models.dart';
 import 'package:photobooth/screens/staff/staff_dashboard_helpers.dart';
 import 'package:photobooth/screens/staff/staff_dashboard_viewmodel.dart';
+import 'package:photobooth/services/offline_operator_pin_store.dart';
 import 'package:photobooth/utils/exceptions.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 class _FakeGateway implements StaffDashboardGateway {
   StaffOpsSession session = const StaffOpsSession(
@@ -35,6 +39,7 @@ class _FakeGateway implements StaffDashboardGateway {
   bool throwUnexpected = false;
   int checkInCalls = 0;
   int logoutCalls = 0;
+  Completer<StaffPerformanceStats?>? statsDelay;
 
   @override
   Future<StaffOpsSession> fetchStaffOpsSession() async {
@@ -51,6 +56,8 @@ class _FakeGateway implements StaffDashboardGateway {
   @override
   Future<StaffPerformanceStats?> fetchStaffStats(String staffId) async {
     _throwIfNeeded();
+    final delayed = statsDelay;
+    if (delayed != null) return delayed.future;
     return stats;
   }
 
@@ -115,6 +122,14 @@ class _FakeGateway implements StaffDashboardGateway {
     logoutCalls++;
   }
 
+  @override
+  Future<void> updateOfflineCashPin(String pin) async {
+    _throwIfNeeded();
+    lastOfflinePin = pin;
+  }
+
+  String? lastOfflinePin;
+
   void _throwIfNeeded() {
     if (throwUnexpected) {
       throw StateError('boom');
@@ -127,12 +142,36 @@ class _FakeGateway implements StaffDashboardGateway {
   }
 }
 
+Future<void> _flushMicrotasks() => Future<void>.delayed(Duration.zero);
+
 void main() {
+  setUp(StaffOpsSessionHold.clearForTests);
+
+  group('StaffOpsSessionHold', () {
+    test('store then take returns once', () {
+      const session = StaffOpsSession(
+        staff: StaffOpsMember(id: 's1', name: 'Ada', staffCode: 'EMP1'),
+        isCheckedIn: true,
+        hasOpenRegister: false,
+      );
+      StaffOpsSessionHold.store(session);
+      expect(StaffOpsSessionHold.take()?.staff.name, 'Ada');
+      expect(StaffOpsSessionHold.take(), isNull);
+    });
+  });
   group('StaffDashboardHelpers', () {
     test('validates iso dates', () {
       expect(StaffDashboardHelpers.isValidIsoDate('2026-07-20'), isTrue);
       expect(StaffDashboardHelpers.isValidIsoDate('20-07-2026'), isFalse);
       expect(StaffDashboardHelpers.isValidIsoDate(''), isFalse);
+    });
+
+    test('parses iso dates', () {
+      expect(
+        StaffDashboardHelpers.tryParseIsoDate('2026-07-20'),
+        DateTime(2026, 7, 20),
+      );
+      expect(StaffDashboardHelpers.tryParseIsoDate('bad'), isNull);
     });
 
     test('formats day label', () {
@@ -282,10 +321,74 @@ void main() {
         initialDate: '2026-07-20',
       );
       await vm.loadAll();
+      await _flushMicrotasks();
       expect(vm.session?.staff.name, 'Ada');
       expect(vm.daySummary?.sessions, 3);
       expect(vm.stats?.totalHours, 12.5);
       expect(vm.loading, isFalse);
+    });
+
+    test('loadAll paints before slow stats finish', () async {
+      final gw = _FakeGateway();
+      gw.statsDelay = Completer<StaffPerformanceStats?>();
+      final vm = StaffDashboardViewModel(
+        gateway: gw,
+        initialDate: '2026-07-20',
+      );
+      await vm.loadAll();
+      expect(vm.session?.staff.name, 'Ada');
+      expect(vm.daySummary?.sessions, 3);
+      expect(vm.stats, isNull);
+      expect(vm.loading, isFalse);
+      gw.statsDelay!.complete(gw.stats);
+      await _flushMicrotasks();
+      expect(vm.stats?.totalHours, 12.5);
+    });
+
+    test('seeded session is visible before loadAll', () {
+      const seeded = StaffOpsSession(
+        staff: StaffOpsMember(id: 's9', name: 'Seeded', staffCode: 'EMP9'),
+        isCheckedIn: true,
+        hasOpenRegister: false,
+      );
+      final vm = StaffDashboardViewModel(
+        gateway: _FakeGateway(),
+        initialDate: '2026-07-20',
+        seededSession: seeded,
+      );
+      expect(vm.session?.staff.name, 'Seeded');
+      expect(vm.loading, isFalse);
+    });
+
+    test('stats failure does not fail loadAll', () async {
+      final gw = _FakeGateway();
+      gw.statsDelay = Completer<StaffPerformanceStats?>();
+      final vm = StaffDashboardViewModel(
+        gateway: gw,
+        initialDate: '2026-07-20',
+      );
+      await vm.loadAll();
+      expect(vm.loading, isFalse);
+      gw.statsDelay!.completeError(ApiException('stats down', 500));
+      await _flushMicrotasks();
+      expect(vm.session, isNotNull);
+      expect(vm.error, isNull);
+    });
+
+    test('loadAll skips stats when staff id is empty', () async {
+      final gw = _FakeGateway();
+      gw.session = const StaffOpsSession(
+        staff: StaffOpsMember(id: '  ', name: 'Ada', staffCode: 'EMP1'),
+        isCheckedIn: false,
+        hasOpenRegister: false,
+      );
+      final vm = StaffDashboardViewModel(
+        gateway: gw,
+        initialDate: '2026-07-20',
+      );
+      await vm.loadAll();
+      await _flushMicrotasks();
+      expect(vm.stats, isNull);
     });
 
     test('checkIn and checkOut update session', () async {
@@ -424,6 +527,67 @@ void main() {
       final b = vm.loadAll();
       await Future.wait([a, b]);
       expect(vm.session, isNotNull);
+    });
+
+    test('updateOfflineCashPin rejects invalid format', () async {
+      final gw = _FakeGateway();
+      final vm = StaffDashboardViewModel(
+        gateway: gw,
+        initialDate: '2026-07-20',
+      );
+      await vm.loadAll();
+      final ok = await vm.updateOfflineCashPin('12');
+      expect(ok, isFalse);
+      expect(vm.error, isNotNull);
+      expect(gw.lastOfflinePin, isNull);
+    });
+
+    test('updateOfflineCashPin syncs via gateway', () async {
+      SharedPreferences.setMockInitialValues({});
+      OfflineOperatorPinStore.resetCacheForTests();
+      final gw = _FakeGateway();
+      final vm = StaffDashboardViewModel(
+        gateway: gw,
+        initialDate: '2026-07-20',
+      );
+      await vm.loadAll();
+      final ok = await vm.updateOfflineCashPin('1357');
+      expect(ok, isTrue);
+      expect(gw.lastOfflinePin, '1357');
+      expect(vm.error, isNull);
+      expect(await OfflineOperatorPinStore.verifyPin('1357'), isTrue);
+    });
+
+    test('updateOfflineCashPin keeps local pin when cloud fails', () async {
+      SharedPreferences.setMockInitialValues({});
+      OfflineOperatorPinStore.resetCacheForTests();
+      final gw = _FakeGateway();
+      final vm = StaffDashboardViewModel(
+        gateway: gw,
+        initialDate: '2026-07-20',
+      );
+      await vm.loadAll();
+      gw.failNext = ApiException('offline');
+      final ok = await vm.updateOfflineCashPin('8888');
+      expect(ok, isTrue);
+      expect(await OfflineOperatorPinStore.verifyPin('8888'), isTrue);
+      expect(vm.error, contains('Saved on this kiosk only'));
+    });
+
+    test('updateOfflineCashPin keeps local pin on unexpected errors', () async {
+      SharedPreferences.setMockInitialValues({});
+      OfflineOperatorPinStore.resetCacheForTests();
+      final gw = _FakeGateway();
+      final vm = StaffDashboardViewModel(
+        gateway: gw,
+        initialDate: '2026-07-20',
+      );
+      await vm.loadAll();
+      gw.throwUnexpected = true;
+      final ok = await vm.updateOfflineCashPin('7777');
+      expect(ok, isTrue);
+      expect(await OfflineOperatorPinStore.verifyPin('7777'), isTrue);
+      expect(vm.error, contains('Saved on this kiosk only'));
     });
   });
 }

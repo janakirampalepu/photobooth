@@ -32,15 +32,25 @@ import 'services/firebase_messaging_background.dart';
 import 'services/payment_push_coordinator.dart';
 import 'services/api_service.dart';
 import 'services/client_identification.dart';
+import 'services/kiosk_health_service.dart';
 import 'services/session_manager.dart';
+import 'services/local_kiosk_store.dart';
+import 'services/local_media_store.dart';
+import 'services/kiosk_disk_guard.dart';
+import 'services/kiosk_outbox_worker.dart';
+import 'services/kiosk_manager.dart';
 import 'services/low_memory_monitor.dart';
 import 'utils/app_config.dart';
+import 'services/api_environment_store.dart';
+import 'utils/edge_to_edge.dart';
 import 'utils/platform_capabilities.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await enableAppEdgeToEdge();
 
   await ClientIdentification.ensureInitialized();
+  await ApiEnvironmentStore.load();
 
   // Generous defaults until `/api/settings` loads; [AppSettingsManager] reapplies limits.
   applyFlutterImageCacheLimits();
@@ -98,12 +108,46 @@ Future<void> main() async {
 
   configureFlutterErrorHandlers();
 
+  if (!kIsWeb) {
+    await LocalKioskStore.init();
+    final store = LocalKioskStore.instance;
+    if (store != null) {
+      final media = LocalMediaStore();
+      final api = ApiService();
+      KioskOutboxWorker(
+        store: store,
+        ingestEntities: (code, items) => api.ingestKioskEntities(
+          kioskCode: code,
+          items: [for (final item in items) item.toJson()],
+        ),
+        ingestAsset: (code, asset) => api.ingestKioskAsset(
+          kioskCode: code,
+          prefix: asset.prefix,
+          filename: asset.filename,
+          bytes: asset.bytes,
+        ),
+        resolveKioskCode: KioskManager().getKioskCode,
+        media: media,
+        diskGuard: KioskDiskGuard(store: store, media: media),
+      ).start();
+    }
+  }
   await SessionManager().restore();
 
   logErrorReportingReady();
 
   if (!kIsWeb) {
     LowMemoryMonitor.instance.start();
+    KioskHealthService.sendHeartbeat = (request) {
+      return ApiService().postKioskHeartbeat(
+        kioskCode: request.kioskCode,
+        appVersion: request.appVersion,
+        processExits: [
+          for (final exit in request.processExits) exit.toJson(),
+        ],
+      );
+    };
+    KioskHealthService.instance.start();
   }
 
   final navigatorKey = GlobalKey<NavigatorState>();
@@ -136,7 +180,9 @@ class _PhotoBoothAppState extends State<PhotoBoothApp>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     PaymentPushCoordinator.instance.attachNavigator(widget.navigatorKey);
-    _appSettingsManager.fetchSettings(forceRefresh: true);
+    // Disk only — a network GET /api/settings without ?kiosk= is discarded after
+    // splash binds. Splash still force-refreshes kiosk-scoped settings.
+    unawaited(_appSettingsManager.hydrateFromCache());
     unawaited(_staffThemeController.load());
     if (supportsFirebaseMessaging) {
       unawaited(_setupPaymentFcmListeners());
@@ -258,6 +304,7 @@ class _PhotoBoothAppState extends State<PhotoBoothApp>
   void dispose() {
     if (!kIsWeb) {
       LowMemoryMonitor.instance.stop();
+      KioskHealthService.instance.stop();
     }
     _fcmForegroundSub?.cancel();
     _fcmOpenedAppSub?.cancel();
@@ -276,7 +323,12 @@ class _PhotoBoothAppState extends State<PhotoBoothApp>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      _appSettingsManager.fetchSettings(forceRefresh: true);
+      // Disk/memory only when unbound — do not GET `/api/settings` with no
+      // `?kiosk=`. Splash bind still force-refreshes kiosk-scoped settings.
+      unawaited(_appSettingsManager.refreshOnAppResume());
+      if (!kIsWeb) {
+        unawaited(KioskHealthService.instance.ping());
+      }
       if (supportsFirebaseMessaging) {
         unawaited(
           PaymentPushCoordinator.instance.flushPendingStoragePayment(),
@@ -287,6 +339,9 @@ class _PhotoBoothAppState extends State<PhotoBoothApp>
 
   @override
   Widget build(BuildContext context) {
+    const appBarTheme = AppBarTheme(
+      systemOverlayStyle: kEdgeToEdgeOverlayStyle,
+    );
     return MultiProvider(
       providers: [
         ChangeNotifierProvider<SessionManager>.value(value: SessionManager()),
@@ -309,14 +364,17 @@ class _PhotoBoothAppState extends State<PhotoBoothApp>
             return Consumer<AppSettingsManager>(
               builder: (context, _, __) {
                 AliceInspector.syncWithRuntimeConfig();
-                return ListenableBuilder(
-                  listenable: _routeTracker,
-                  builder: (context, __) {
-                    return DebugPerformanceOverlayScope(
-                      routeName: _routeTracker.currentRouteName,
-                      child: child ?? const SizedBox.shrink(),
-                    );
-                  },
+                return Provider<Alice?>.value(
+                  value: AliceInspector.instance,
+                  child: ListenableBuilder(
+                    listenable: _routeTracker,
+                    builder: (context, __) {
+                      return DebugPerformanceOverlayScope(
+                        routeName: _routeTracker.currentRouteName,
+                        child: child ?? const SizedBox.shrink(),
+                      );
+                    },
+                  ),
                 );
               },
             );
@@ -325,11 +383,13 @@ class _PhotoBoothAppState extends State<PhotoBoothApp>
             colorScheme: ColorScheme.fromSeed(
                 seedColor: Colors.blue, brightness: Brightness.light),
             useMaterial3: true,
+            appBarTheme: appBarTheme,
           ),
           darkTheme: ThemeData(
             colorScheme: ColorScheme.fromSeed(
                 seedColor: Colors.blue, brightness: Brightness.dark),
             useMaterial3: true,
+            appBarTheme: appBarTheme,
           ),
           themeMode: ThemeMode.system,
           localizationsDelegates: const [

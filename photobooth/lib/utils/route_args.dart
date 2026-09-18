@@ -72,8 +72,8 @@ class CaptureRouteArgs {
       multiShotTotal! >= 1 &&
       flashbackTheme != null;
 
-  /// Four-pose strip (look picker) vs single 6×4 print.
-  bool get isFlashbackFourShot =>
+  /// Multi-pose 2×6 strip (look picker) vs single 6×4 print.
+  bool get isFlashbackStrip =>
       isFlashbackMultiShot && resolvedShotTotal > 1;
 
   bool get isFlashbackSingle6x4 =>
@@ -130,6 +130,9 @@ class CaptureRouteArgs {
     if (name == '1' || name == 'single' || name == 'single6x4') {
       return ClassicShotMode.single6x4;
     }
+    if (name == '3' || name == 'three' || name == 'threeShot') {
+      return ClassicShotMode.threeShot;
+    }
     if (name == '4' || name == 'four' || name == 'fourShot') {
       return ClassicShotMode.fourShot;
     }
@@ -151,6 +154,35 @@ class FlashbackCaptureArgs {
     if (args is FlashbackCaptureArgs) return args;
     if (args is Map && args['theme'] is ThemeModel) {
       return FlashbackCaptureArgs(theme: args['theme'] as ThemeModel);
+    }
+    return null;
+  }
+}
+
+/// Args for Classic shot-mode preview (after experience choice when >1 mode).
+class ClassicShotChoiceArgs {
+  final ThemeModel theme;
+  final List<int> modes;
+
+  const ClassicShotChoiceArgs({
+    required this.theme,
+    required this.modes,
+  });
+
+  static ClassicShotChoiceArgs? tryParse(Object? args) {
+    if (args is ClassicShotChoiceArgs) return args;
+    if (args is Map && args['theme'] is ThemeModel) {
+      final raw = args['modes'];
+      final modes = raw is List
+          ? raw
+              .map((e) => e is int ? e : int.tryParse('$e'))
+              .whereType<int>()
+              .toList()
+          : const <int>[];
+      return ClassicShotChoiceArgs(
+        theme: args['theme'] as ThemeModel,
+        modes: normalizeClassicShotModes(modes),
+      );
     }
     return null;
   }
@@ -194,9 +226,7 @@ class FlashbackFilterArgs {
   ClassicShotMode get resolvedShotMode {
     final mode = classicShotMode;
     if (mode != null) return mode;
-    return _captureCount == 1
-        ? ClassicShotMode.single6x4
-        : ClassicShotMode.fourShot;
+    return classicStripShotModeForCount(_captureCount);
   }
 
   static FlashbackFilterArgs? tryParse(Object? args) {
@@ -249,7 +279,7 @@ class FlashbackPrePayArgs {
       if (raw is! List) return null;
       final urls =
           raw.map((e) => e.toString()).where((s) => s.isNotEmpty).toList();
-      if (urls.length != 1 && urls.length != kStripShotCount) return null;
+      if (!isValidClassicComposeShotCount(urls.length)) return null;
       return FlashbackPrePayArgs(
         theme: args['theme'] as ThemeModel,
         imageDataUrls: urls,
@@ -337,6 +367,9 @@ class ResultArgs {
   /// FotoFlashback only — WCM cut size (e.g. `s6x2_2` for `6x2*2`). Null keeps AI size.
   final String? printSize;
 
+  /// Classic compose still count (1 = uncut 4×6 / 6×4; 3/4 = dual strip).
+  final int? classicComposeShotCount;
+
   /// Transformation run for View details (FotoFlashback compose / AI generate).
   final String? transformationRunId;
   final CustomerContactCapture contact;
@@ -352,6 +385,7 @@ class ResultArgs {
     this.originalPhoto,
     this.printOrientation = PrintOrientation.portrait,
     this.printSize,
+    this.classicComposeShotCount,
     this.transformationRunId,
     this.contact = CustomerContactCapture.empty,
   });
@@ -366,6 +400,15 @@ class ResultArgs {
       final rawPrintSize = args['printSize']?.toString().trim();
       final rawRunId = args['transformationRunId']?.toString().trim() ??
           args['runId']?.toString().trim();
+      final rawShotCount = args['classicComposeShotCount'] ??
+          args['classic_compose_shot_count'] ??
+          args['shotCount'];
+      int? shotCount;
+      if (rawShotCount is int) {
+        shotCount = rawShotCount;
+      } else if (rawShotCount is String) {
+        shotCount = int.tryParse(rawShotCount.trim());
+      }
       return ResultArgs(
         generatedImages: generatedImages,
         originalPhoto: originalPhoto,
@@ -376,6 +419,7 @@ class ResultArgs {
         printSize: (rawPrintSize != null && rawPrintSize.isNotEmpty)
             ? rawPrintSize
             : null,
+        classicComposeShotCount: shotCount,
         transformationRunId:
             (rawRunId != null && rawRunId.isNotEmpty) ? rawRunId : null,
         contact: CustomerContactCapture.tryParseRouteMap(args),

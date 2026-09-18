@@ -9,7 +9,8 @@ import 'package:flutter/painting.dart'
         ImageConfiguration,
         ImageProvider,
         ImageStreamListener,
-        NetworkImage;
+        NetworkImage,
+        ResizeImage;
 import '../../services/api_service.dart';
 import '../../services/app_settings_manager.dart';
 import '../../services/session_manager.dart';
@@ -20,6 +21,7 @@ import '../../utils/ai_attempts_budget.dart';
 import '../../utils/constants.dart';
 import '../../utils/app_strings.dart';
 import '../../utils/exceptions.dart';
+import '../../utils/kiosk_offline_ux.dart';
 import '../../utils/logger.dart';
 import '../../utils/memory_pressure_response.dart';
 import '../../utils/error_reporting_helpers.dart';
@@ -30,6 +32,8 @@ import '../../services/generation_display_preferences.dart';
 import '../../models/parallel_generation_result.dart';
 import '../../models/generation_timing_stats.dart';
 import '../../services/error_reporting/error_reporting_manager.dart';
+import '../../services/local_guest_media_write.dart';
+import '../../services/local_media_store.dart';
 import '../../utils/web_flow_trace.dart';
 import '../../utils/session_photo_sync_helpers.dart';
 
@@ -106,13 +110,16 @@ class PipelineFunnelSlot {
 
   final String stageKey;
   final String label;
+
   /// Deduped preview: null if no API image yet, or same pixels as the previous slot.
   final String? displayPreviewUrl;
   final bool isPending;
   final bool isActive;
   final bool isFinished;
+
   /// True for [kPipelineDeviceCaptureStageKey] — use [PhotoModel.imageFile] in the view.
   final bool isDeviceCapture;
+
   /// EXIF / C2PA: usually no [displayPreviewUrl]; show badge UI instead of expecting pixels.
   final bool isMetadataOnlyStage;
 }
@@ -256,14 +263,14 @@ class PhotoGenerateViewModel extends ChangeNotifier {
   String? _errorMessage;
   int _maxRegenerationsAllowed = AppConstants.kDefaultMaxRegenerations;
   int _triesRemaining = AppConstants.kDefaultMaxRegenerations;
-  
+
   // Timer for generation progress
   Timer? _timer;
   int _elapsedSeconds = 0;
-  
+
   // Generation progress message
   String _progressMessage = '';
-  
+
   // Cancellation flag
   bool _isCancelled = false;
 
@@ -341,7 +348,9 @@ class PhotoGenerateViewModel extends ChangeNotifier {
   bool get hasError => _errorMessage != null;
   int get triesRemaining => _triesRemaining;
   int get maxRegenerationsAllowed => _maxRegenerationsAllowed;
-  bool get canTryDifferentStyle => _triesRemaining > 0 && !_isGenerating && !_isLoadingMore;
+  bool get canTryDifferentStyle =>
+      _triesRemaining > 0 && !_isGenerating && !_isLoadingMore;
+
   /// Whether the UI may offer “add one more style” (cap from `/api/settings` `maxRegenerations`).
   bool get canShowAddAnotherStyleButton =>
       generatedImages.length < _maxRegenerationsAllowed && triesRemaining > 0;
@@ -566,7 +575,8 @@ class PhotoGenerateViewModel extends ChangeNotifier {
 
   Future<void> loadProgressiveDisplayPreference() async {
     if (_progressivePrefLoaded) return;
-    final v = await GenerationDisplayPreferences.getUseProgressiveGenerationUi();
+    final v =
+        await GenerationDisplayPreferences.getUseProgressiveGenerationUi();
     _useProgressiveGenerationUi = v;
     _progressivePrefLoaded = true;
     notifyListeners();
@@ -581,21 +591,22 @@ class PhotoGenerateViewModel extends ChangeNotifier {
   Future<void> toggleProgressiveGenerationUi() async {
     await setProgressiveGenerationUi(!_useProgressiveGenerationUi);
   }
-  
+
   // Check if any operation is in progress
   bool get isOperationInProgress => _isGenerating || _isLoadingMore;
-  
+
   // Get all selected generated images (for proceeding to payment)
   List<GeneratedImage> get selectedGeneratedImages {
     return _generatedImages.where((img) => img.isSelected).toList();
   }
-  
+
   // Check if at least one image is selected
   bool get hasSelectedImages => selectedGeneratedImages.isNotEmpty;
-  
+
   // Get count of selected images
-  int get selectedCount => _generatedImages.where((img) => img.isSelected).length;
-  
+  int get selectedCount =>
+      _generatedImages.where((img) => img.isSelected).length;
+
   bool get hasGeneratedImages => _generatedImages.isNotEmpty;
 
   /// Newest generation is first in [_generatedImages] (prepended batches). It stays selected.
@@ -619,9 +630,8 @@ class PhotoGenerateViewModel extends ChangeNotifier {
 
   void _refreshMaxRegenerationsFromSettings() {
     final n = _appSettingsManager?.settings?.maxRegenerations;
-    _maxRegenerationsAllowed = (n != null && n > 0)
-        ? n
-        : AppConstants.kDefaultMaxRegenerations;
+    _maxRegenerationsAllowed =
+        (n != null && n > 0) ? n : AppConstants.kDefaultMaxRegenerations;
   }
 
   /// 1-based attempt for POST `/api/generate-image` when `parallelImageCount` is 1.
@@ -669,7 +679,13 @@ class PhotoGenerateViewModel extends ChangeNotifier {
     if (hero == null) return;
     final url = SecureImageUrl.withSessionId(hero.imageUrl);
     if (url.isEmpty) return;
-    final aspect = await aspectRatioFromImageProvider(NetworkImage(url));
+    final aspect = await aspectRatioFromImageProvider(
+      ResizeImage.resizeIfNeeded(
+        AppConstants.kNetworkImageAspectProbePx,
+        null,
+        NetworkImage(url),
+      ),
+    );
     if (aspect == null) return;
 
     var changed = false;
@@ -743,21 +759,27 @@ class PhotoGenerateViewModel extends ChangeNotifier {
   }
 
   /// Refreshes [attemptsUsed] from the server and recomputes [_triesRemaining].
-  Future<void> syncAttemptsBudgetFromServer() async {
+  ///
+  /// Skips GET `/api/sessions/:id` when [forceRefresh] is false and memory
+  /// already has this session (theme continue / generate start). Always GET
+  /// after a generation so server attemptsUsed wins.
+  Future<void> syncAttemptsBudgetFromServer({bool forceRefresh = false}) async {
     final sid = _sessionManager.sessionId;
     if (sid == null) return;
-    try {
-      final raw = await _apiService.fetchSession(sid);
-      if (raw != null) {
-        _sessionManager.setSessionFromResponse(raw);
-        final direct = raw['stripCompositeUrl']?.toString().trim() ??
-            raw['strip_composite_url']?.toString().trim();
-        if (direct != null && direct.isNotEmpty) {
-          _stripCompositeUrlHint = direct;
+    if (forceRefresh) {
+      try {
+        final raw = await _apiService.fetchSession(sid);
+        if (raw != null) {
+          _sessionManager.setSessionFromResponse(raw);
+          final direct = raw['stripCompositeUrl']?.toString().trim() ??
+              raw['strip_composite_url']?.toString().trim();
+          if (direct != null && direct.isNotEmpty) {
+            _stripCompositeUrlHint = direct;
+          }
         }
+      } catch (e) {
+        AppLogger.debug('Could not refresh session attempts: $e');
       }
-    } catch (e) {
-      AppLogger.debug('Could not refresh session attempts: $e');
     }
     try {
       await _appSettingsManager?.fetchSettings();
@@ -1019,7 +1041,8 @@ class PhotoGenerateViewModel extends ChangeNotifier {
       previewImageUrl: previewUrl ?? prev?.previewImageUrl,
     );
     if (i >= 0) {
-      final list = List<ProgressivePipelineStage>.from(_progressivePipelineStages);
+      final list =
+          List<ProgressivePipelineStage>.from(_progressivePipelineStages);
       list[i] = next;
       _progressivePipelineStages = list;
     } else {
@@ -1193,16 +1216,22 @@ class PhotoGenerateViewModel extends ChangeNotifier {
     try {
       await _refreshGenerationRunStepsNow();
     } catch (_) {}
-    final newImages = generatedImagesFromParallelResult(
-      parallel: parallel,
-      theme: theme,
-      newImageId: _newGeneratedImageId,
+    final newImages = await _persistGeneratedGuestImages(
+      generatedImagesFromParallelResult(
+        parallel: parallel,
+        theme: theme,
+        newImageId: _newGeneratedImageId,
+      ),
     );
     _generatedImages = [...newImages, ..._generatedImages];
     _ensureNewestAlwaysSelected();
+    await _sessionManager.attachDeliverableImageUrls(
+      imageUrls: newImages.map((g) => g.imageUrl),
+    );
     final usedBefore = _sessionManager.currentSession?.attemptsUsed ?? 0;
-    await syncAttemptsBudgetFromServer();
-    final usedAfter = _sessionManager.currentSession?.attemptsUsed ?? usedBefore;
+    await syncAttemptsBudgetFromServer(forceRefresh: true);
+    final usedAfter =
+        _sessionManager.currentSession?.attemptsUsed ?? usedBefore;
     if (usedAfter <= usedBefore) {
       _bumpSessionAttemptsUsedLocally();
     }
@@ -1211,6 +1240,40 @@ class PhotoGenerateViewModel extends ChangeNotifier {
     unawaited(_syncBeholdAspectFromGeneratedHero());
     onSuccessLog?.call();
     return true;
+  }
+
+  Future<bool> _completeFrameOnlyLocally() async {
+    final photo = _originalPhoto;
+    final theme = _selectedTheme;
+    if (photo == null || theme == null) return false;
+    _errorMessage = null;
+    _progressMessage = AppStrings.offlineFrameOnlyMessage;
+    final stored = await persistCapturedGuestXFile(photo.imageFile);
+    final url = guestSessionUrlForPath(stored.path) ?? stored.path;
+    _generatedImages = [
+      GeneratedImage(
+        id: 'frame_only_${photo.id}',
+        imageUrl: url,
+        theme: theme,
+        isSelected: true,
+        printSize: AppConstants.kPrintSizePortrait4x6,
+      ),
+    ];
+    _ensureNewestAlwaysSelected();
+    await _sessionManager.attachDeliverableImageUrls(imageUrls: [url]);
+    notifyListeners();
+    return true;
+  }
+
+  Future<bool> _recoverFrameOnlyIfWanDown(Object error) async {
+    if (!KioskOfflineUx.shouldSkipAiGeneration(
+      sessionOffline: _sessionManager.isOfflineSession,
+      error: error,
+    )) {
+      return false;
+    }
+    _sessionManager.markSessionOffline();
+    return _completeFrameOnlyLocally();
   }
 
   /// Generate image with the current theme
@@ -1223,6 +1286,12 @@ class PhotoGenerateViewModel extends ChangeNotifier {
     if (_isGenerating) {
       AppLogger.debug('generateImage ignored: already in progress');
       return false;
+    }
+
+    if (KioskOfflineUx.shouldSkipAiGeneration(
+      sessionOffline: _sessionManager.isOfflineSession,
+    )) {
+      return _completeFrameOnlyLocally();
     }
 
     await syncAttemptsBudgetFromServer();
@@ -1240,7 +1309,7 @@ class PhotoGenerateViewModel extends ChangeNotifier {
     _errorMessage = null;
     _progressMessage = 'Preparing transformation...';
     notifyListeners();
-    
+
     _startTimer();
     _startGenerationRunPolling();
     unawaited(_loadGenerationTimingStats());
@@ -1259,7 +1328,8 @@ class PhotoGenerateViewModel extends ChangeNotifier {
       } catch (_) {
         // Use [resolveParallelImageCount] fallback if settings unavailable.
       }
-      AppLogger.debug('🎨 Starting image generation with theme: ${_selectedTheme!.name}');
+      AppLogger.debug(
+          '🎨 Starting image generation with theme: ${_selectedTheme!.name}');
       ErrorReportingManager.log('Starting image generation');
 
       final sessionId = _sessionManager.sessionId;
@@ -1288,7 +1358,7 @@ class PhotoGenerateViewModel extends ChangeNotifier {
             photoSync.errorMessage ?? AppStrings.sessionPhotoSyncFailed;
         return false;
       }
-      
+
       _updateProgress('Transforming your look...');
       WebFlowTrace.log('GENERATE', 'api_call_start');
 
@@ -1327,11 +1397,16 @@ class PhotoGenerateViewModel extends ChangeNotifier {
         assignSucceeded: (v) => succeeded = v,
       );
       if (ok) {
-        WebFlowTrace.log('OUTPUT', 'result_ready images=${_generatedImages.length}');
+        WebFlowTrace.log(
+            'OUTPUT', 'result_ready images=${_generatedImages.length}');
       }
       return ok;
     } catch (e, stackTrace) {
       _stopTimer();
+      if (await _recoverFrameOnlyIfWanDown(e)) {
+        succeeded = true;
+        return true;
+      }
       WebFlowTrace.log('GENERATE', 'ERROR $e');
       AppLogger.error('❌ Error generating image: $e');
       await ErrorReportingManager.recordError(
@@ -1371,14 +1446,24 @@ class PhotoGenerateViewModel extends ChangeNotifier {
     if (_originalPhoto == null) return false;
     if (!_isLoadingMore && !canTryDifferentStyle) return false;
 
+    if (KioskOfflineUx.shouldSkipAiGeneration(
+      sessionOffline: _sessionManager.isOfflineSession,
+    )) {
+      _isLoadingMore = false;
+      _errorMessage = AppStrings.offlineFrameOnlyMessage;
+      notifyListeners();
+      return false;
+    }
+
     var succeeded = false;
     _resetCancellation();
     _resetLiveGenerationState();
     _isLoadingMore = true;
     _errorMessage = null;
-    _progressMessage = _progressMessage.isNotEmpty ? _progressMessage : 'Trying new style...';
+    _progressMessage =
+        _progressMessage.isNotEmpty ? _progressMessage : 'Trying new style...';
     notifyListeners();
-    
+
     _startTimer();
     _startGenerationRunPolling();
     unawaited(_loadGenerationTimingStats());
@@ -1388,9 +1473,9 @@ class PhotoGenerateViewModel extends ChangeNotifier {
 
       // Update session with new theme
       _selectedTheme = newTheme;
-      
+
       AppLogger.debug('🎨 Trying different style with theme: ${newTheme.name}');
-      
+
       // Update session with the new theme
       try {
         final patch = await _apiService.updateSession(
@@ -1413,13 +1498,11 @@ class PhotoGenerateViewModel extends ChangeNotifier {
         return false;
       }
 
-      await syncAttemptsBudgetFromServer();
-
       if (_triesRemaining <= 0) {
         _errorMessage = AppStrings.generationNoAttemptsRemaining;
         return false;
       }
-      
+
       _updateProgress('Transforming your look...');
 
       final parallel = await _apiService.generateImages(
@@ -1505,14 +1588,16 @@ class PhotoGenerateViewModel extends ChangeNotifier {
   int get selectedTotalPrice {
     final count = selectedCount;
     if (count <= 0) return 0;
-    return initialPrintPrice + (count > 1 ? (count - 1) * additionalPrintPrice : 0);
+    return initialPrintPrice +
+        (count > 1 ? (count - 1) * additionalPrintPrice : 0);
   }
 
   /// Remove a generated image by id. No-op if only one remains (keep at least one).
   /// Restores one "try" so the user can add a style again (e.g. re-add the removed theme).
   void removeGeneratedImage(String imageId) {
     if (_generatedImages.length <= 1) return;
-    _generatedImages = _generatedImages.where((img) => img.id != imageId).toList();
+    _generatedImages =
+        _generatedImages.where((img) => img.id != imageId).toList();
     if (_generatedImages.isNotEmpty) {
       final newestId = _generatedImages.first.id;
       _generatedImages = _generatedImages
@@ -1524,7 +1609,7 @@ class PhotoGenerateViewModel extends ChangeNotifier {
     _refundSessionAttemptLocally();
     notifyListeners();
   }
-  
+
   /// Select all images
   void selectAllImages() {
     _generatedImages = _generatedImages.map((img) {
@@ -1532,7 +1617,7 @@ class PhotoGenerateViewModel extends ChangeNotifier {
     }).toList();
     notifyListeners();
   }
-  
+
   /// Deselect all except the newest (keeps at least one selected).
   void deselectAllImages() {
     if (_generatedImages.isEmpty) return;
@@ -1575,7 +1660,7 @@ class PhotoGenerateViewModel extends ChangeNotifier {
     notifyListeners();
     AppLogger.debug('🚫 Operation cancelled by user');
   }
-  
+
   /// Reset cancellation flag (call before starting new operation)
   void _resetCancellation() {
     _isCancelled = false;

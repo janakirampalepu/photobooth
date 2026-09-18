@@ -1,10 +1,15 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:photobooth/utils/app_runtime_config.dart';
 import 'package:photobooth/utils/app_strings.dart';
 import 'package:photobooth/utils/capture_session_kind.dart';
 import 'package:photobooth/utils/classic_pose_mode_helpers.dart';
 import 'package:photobooth/utils/classic_shot_mode.dart';
 
 void main() {
+  setUp(() {
+    AppRuntimeConfig.instance.applyFromSettings(null);
+  });
+
   group('captureSessionKindForClassic', () {
     test('maps 1-shot and 4-shot', () {
       expect(
@@ -14,6 +19,13 @@ void main() {
       expect(
         captureSessionKindForClassic(ClassicShotMode.fourShot),
         CaptureSessionKind.classicFourShot,
+      );
+    });
+
+    test('maps 3-shot to its own kind, not four', () {
+      expect(
+        captureSessionKindForClassic(ClassicShotMode.threeShot),
+        CaptureSessionKind.classicThreeShot,
       );
     });
   });
@@ -33,6 +45,27 @@ void main() {
       );
       expect(AppStrings.flashbackCaptureSubtitle, contains('10s'));
       expect(AppStrings.flashbackCaptureSubtitle, contains('8s'));
+    });
+
+    test('3-shot keeps the strip timings but says three shots', () {
+      expect(
+        classicPoseSubtitle(ClassicShotMode.threeShot),
+        AppStrings.flashbackCaptureSubtitleThree,
+      );
+      expect(AppStrings.flashbackCaptureSubtitleThree, contains('3 shots'));
+      expect(AppStrings.flashbackCaptureSubtitleThree, contains('10s'));
+      expect(AppStrings.flashbackCaptureSubtitleThree, contains('8s'));
+    });
+
+    test('uses the kiosk pose seconds when provided', () {
+      expect(
+        classicPoseSubtitle(ClassicShotMode.single6x4, poseSeconds: 7),
+        AppStrings.flashbackCaptureSubtitleSingleFor(7),
+      );
+      expect(
+        classicPoseSubtitle(ClassicShotMode.fourShot, poseSeconds: 7),
+        contains('7s'),
+      );
     });
   });
 
@@ -62,6 +95,32 @@ void main() {
         CaptureSessionKind.classicFourShot.classicShotMode,
         ClassicShotMode.fourShot,
       );
+    });
+
+    test('classicThreeShot is a strip session with three shots', () {
+      const kind = CaptureSessionKind.classicThreeShot;
+      expect(kind.isClassic, isTrue);
+      expect(kind.isClassicThreeShot, isTrue);
+      expect(kind.isClassicOneShot, isFalse);
+      expect(kind.isClassicFourShot, isFalse);
+      expect(kind.isFotoZen, isFalse);
+      expect(kind.classicShotCount, 3);
+      expect(kind.classicShotMode, ClassicShotMode.threeShot);
+    });
+
+    test('isClassicStrip covers 3- and 4-shot but never 1-shot or AI', () {
+      expect(CaptureSessionKind.classicThreeShot.isClassicStrip, isTrue);
+      expect(CaptureSessionKind.classicFourShot.isClassicStrip, isTrue);
+      expect(CaptureSessionKind.classicOneShot.isClassicStrip, isFalse);
+      expect(CaptureSessionKind.fotoZen.isClassicStrip, isFalse);
+    });
+
+    test('fromClassicShotMode round-trips every mode', () {
+      for (final mode in ClassicShotMode.values) {
+        final kind = CaptureSessionKindX.fromClassicShotMode(mode);
+        expect(kind.classicShotMode, mode);
+        expect(kind.classicShotCount, mode.shotCount);
+      }
     });
   });
 }

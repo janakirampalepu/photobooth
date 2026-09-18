@@ -2,13 +2,13 @@ name: photobooth
 description: A Flutter photo booth application with AI transformations
 publish_to: 'none'
 # Release version: YEAR.MONTH.DAY+buildNumber (see tool/sync_build_version.dart).
-# Android Fastlane: highest Google Play version code (all tracks) + 1, then writes pubspec.yaml.
-# iOS Fastlane: latest TestFlight build + 1, then writes pubspec.yaml.
-# The AAB/APK/IPA always match the version Fastlane just wrote to pubspec.yaml.
+# iOS Fastlane queries App Store Connect for the latest build on that version, then +1.
+# Android Fastlane queries Google Play for the highest version code (all tracks), then +1.
+# Local `dart run tool/sync_build_version.dart` increments the +suffix in pubspec.
 # Cursor/VS Code: Run Task → "flutter build apk (release)" (runs prebuild: sync version first).
 # CLI: ./scripts/flutter_with_version.sh build web   (plain `flutter build web` does not sync)
 #      dart run tool/sync_build_version.dart
-version: 2026.9.2+59
+version: 2026.9.12+362
 environment:
   sdk: '>=3.0.0 <4.0.0'
 
@@ -47,6 +47,9 @@ dependencies:
   # File Operations
   path_provider: ^2.1.1
   path: ^1.8.3
+  # Event pipeline ingest dedupe (sha1 over sampled bytes). Already resolved
+  # transitively; declared so the direct import is legitimate.
+  crypto: ^3.0.3
 
   # Permissions
   permission_handler: ^12.0.1
@@ -76,6 +79,7 @@ dependencies:
   flutter_zxing: ^2.2.1
   qr_flutter: ^4.1.0
   audioplayers: ^6.7.1
+  sqflite: ^2.4.2+1
 
 dev_dependencies:
   flutter_test:
@@ -88,6 +92,7 @@ dev_dependencies:
   build_runner: ^2.4.7
   json_serializable: ^6.7.1
   flutter_launcher_icons: ^0.13.1
+  sqflite_common_ffi: ^2.4.0+3
 
 # Vendored fork: preview/ImageAnalysis use one preset lower than capture to cut
 # preview RAM; ImageCapture keeps full [ResolutionPreset] (see package README).

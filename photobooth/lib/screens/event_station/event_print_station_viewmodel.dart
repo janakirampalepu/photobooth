@@ -22,7 +22,7 @@ class EventPrintStationViewModel extends ChangeNotifier {
     ApiService? mediaApi,
     EventStationPrintFn? printFn,
     Future<XFile> Function(String url)? downloadImage,
-    Duration pollInterval = const Duration(seconds: 4),
+    Duration pollInterval = const Duration(seconds: 6),
   })  : _api = api ?? EventStationApi(),
         _printFn = printFn,
         _download = downloadImage ??
@@ -44,6 +44,7 @@ class EventPrintStationViewModel extends ChangeNotifier {
   bool get isBusy => _busy;
   String? get errorMessage => _error;
   EventStationStats get stats => _board.stats;
+  EventDeliveryStats get delivery => _board.delivery;
   List<EventPrintStationJob> get allJobs => _board.printJobs;
   List<EventPrintStationJob> get queue => itemsForStationStatus(
         allJobs,
@@ -74,7 +75,9 @@ class EventPrintStationViewModel extends ChangeNotifier {
 
   Future<void> refreshQueue() async {
     try {
-      _board = await _api.fetchBoard();
+      final next = await _api.fetchBoard();
+      if (identical(next, _board) && _error == null) return;
+      _board = next;
       _error = null;
     } on ApiException catch (e) {
       _error = e.message;

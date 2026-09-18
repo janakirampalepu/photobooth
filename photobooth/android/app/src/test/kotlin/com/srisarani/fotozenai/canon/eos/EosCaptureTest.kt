@@ -15,7 +15,6 @@ import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class EosCaptureTest {
-
     private class Rig {
         val channel = FakeUsbBulkChannel(512)
         val transport = UsbTransport(channel, UsbTransport.Config(readTimeoutMs = 50, zlpTimeoutMs = 2))
@@ -26,14 +25,19 @@ class EosCaptureTest {
         var txn = 0L
 
         fun ok(vararg params: Long) {
-            val w = com.srisarani.fotozenai.canon.ptp.PtpWriter()
+            val w =
+                com.srisarani.fotozenai.canon.ptp
+                    .PtpWriter()
             params.forEach { w.u32(it) }
             channel.enqueueTransfer(
                 PtpContainer(PtpContainerType.RESPONSE, PtpResponse.OK, txn++, w.toByteArray()).toByteArray(),
             )
         }
 
-        fun dataThenOk(code: Int, payload: ByteArray) {
+        fun dataThenOk(
+            code: Int,
+            payload: ByteArray,
+        ) {
             channel.enqueueTransfer(PtpContainer.data(code, txn, payload).toByteArray())
             channel.enqueueTransfer(
                 PtpContainer(PtpContainerType.RESPONSE, PtpResponse.OK, txn++).toByteArray(),
@@ -46,22 +50,19 @@ class EosCaptureTest {
             )
         }
 
-        fun commands(): List<PtpContainer> =
-            channel.writes.map { PtpContainer.parse(it) }.filter { it.type == PtpContainerType.COMMAND }
+        fun commands(): List<PtpContainer> = channel.writes.map { PtpContainer.parse(it) }.filter { it.type == PtpContainerType.COMMAND }
 
-        fun dataSent(): List<PtpContainer> =
-            channel.writes.map { PtpContainer.parse(it) }.filter { it.type == PtpContainerType.DATA }
+        fun dataSent(): List<PtpContainer> = channel.writes.map { PtpContainer.parse(it) }.filter { it.type == PtpContainerType.DATA }
     }
 
     // ================================================================ P-05
 
     /**
-     * `P-05`: with capture destination set to the host, EOS bodies want a fake free-space
-     * value or they behave as though the host is full. Capacity must be set FIRST - a
-     * camera that thinks the host has no space can reject the destination change outright.
-     */
-    /**
      * `P-05`, corrected by hardware 2026-08-13.
+     *
+     * With capture destination set to the host, EOS bodies want a fake free-space
+     * value or they behave as though the host is full. Capacity must be set FIRST — a
+     * camera that thinks the host has no space can reject the destination change outright.
      *
      * Capacity is an **operation** (`EOS_PCHDDCapacity`, 0x911A), not a device property.
      * The first implementation wrote property 0xD11A and got `DeviceBusy` on every one of
@@ -71,7 +72,8 @@ class EosCaptureTest {
     @Test
     fun `host capture sets destination FIRST, then announces capacity`() {
         val rig = Rig()
-        rig.ok(); rig.ok()
+        rig.ok()
+        rig.ok()
 
         rig.capture.configureForHostCapture()
 
@@ -80,16 +82,18 @@ class EosCaptureTest {
         // StorageInfoChanged instead of ObjectAdded, and the host waits forever for a
         // photo that was never offered. Nothing errors - which is what made it expensive.
         val codes = rig.commands().map { it.code }
-        assertThat(codes).containsExactly(
-            CanonEosOperation.SET_DEVICE_PROP_VALUE_EX, // destination
-            CanonEosOperation.PC_HDD_CAPACITY,          // then capacity
-        ).inOrder()
+        assertThat(codes)
+            .containsExactly(
+                CanonEosOperation.SET_DEVICE_PROP_VALUE_EX, // destination
+                CanonEosOperation.PC_HDD_CAPACITY, // then capacity
+            ).inOrder()
     }
 
     @Test
     fun `capacity operation sends non-zero parameters`() {
         val rig = Rig()
-        rig.ok(); rig.ok()
+        rig.ok()
+        rig.ok()
 
         rig.capture.configureForHostCapture()
 
@@ -111,7 +115,8 @@ class EosCaptureTest {
     @Test
     fun `destination is set to both card and host`() {
         val rig = Rig()
-        rig.ok(); rig.ok()
+        rig.ok()
+        rig.ok()
 
         rig.capture.configureForHostCapture()
 
@@ -202,9 +207,13 @@ class EosCaptureTest {
         val rig = Rig()
         repeat(4) { rig.fail(PtpResponse.DEVICE_BUSY) }
 
-        val ok = rig.properties.setUInt32WithRetry(
-            EosProperty.CAPACITY, 1, maxAttempts = 3, initialDelayMs = 1,
-        )
+        val ok =
+            rig.properties.setUInt32WithRetry(
+                EosProperty.CAPACITY,
+                1,
+                maxAttempts = 3,
+                initialDelayMs = 1,
+            )
 
         assertThat(ok).isFalse()
         assertThat(rig.commands()).hasSize(3)
@@ -217,48 +226,146 @@ class EosCaptureTest {
      * the order wrong leaves the shutter virtually held down and blocks the next capture.
      */
     @Test
-    fun `release with autofocus does half press then full press, released in reverse`() = runTest {
-        val rig = Rig()
-        repeat(4) { rig.ok() }
+    fun `release with autofocus does half press then full press, released in reverse`() =
+        runTest {
+            val rig = Rig()
+            repeat(4) { rig.ok() }
 
-        rig.capture.release(EosCapture.ReleaseMode.WITH_AUTOFOCUS)
+            rig.capture.release(EosCapture.ReleaseMode.WITH_AUTOFOCUS)
 
-        val sequence = rig.commands().map { it.code to it.parameter(0) }
-        assertThat(sequence).containsExactly(
-            CanonEosOperation.REMOTE_RELEASE_ON to 1L,  // half - AF
-            CanonEosOperation.REMOTE_RELEASE_ON to 2L,  // full - fire
-            CanonEosOperation.REMOTE_RELEASE_OFF to 2L, // release full
-            CanonEosOperation.REMOTE_RELEASE_OFF to 1L, // release half
-        ).inOrder()
-    }
+            val sequence = rig.commands().map { it.code to it.parameter(0) }
+            assertThat(sequence)
+                .containsExactly(
+                    CanonEosOperation.REMOTE_RELEASE_ON to 1L, // half - AF
+                    CanonEosOperation.REMOTE_RELEASE_ON to 3L, // Completely - fire
+                    CanonEosOperation.REMOTE_RELEASE_OFF to 3L, // release full
+                    CanonEosOperation.REMOTE_RELEASE_OFF to 1L, // release half
+                ).inOrder()
+        }
 
     /**
      * `C-02`: when AF cannot lock, the camera will not fire and it looks exactly like a
      * dead event loop. A no-AF path means a possibly-soft frame instead of a hang.
      */
     @Test
-    fun `release without autofocus skips the half press entirely`() = runTest {
-        val rig = Rig()
-        repeat(2) { rig.ok() }
+    fun `release without autofocus skips the half press entirely`() =
+        runTest {
+            val rig = Rig()
+            repeat(2) { rig.ok() }
 
-        rig.capture.release(EosCapture.ReleaseMode.WITHOUT_AUTOFOCUS)
+            rig.capture.release(EosCapture.ReleaseMode.WITHOUT_AUTOFOCUS)
+
+            val sequence = rig.commands().map { it.code to it.parameter(0) }
+            assertThat(sequence)
+                .containsExactly(
+                    CanonEosOperation.REMOTE_RELEASE_ON to 3L,
+                    CanonEosOperation.REMOTE_RELEASE_OFF to 3L,
+                ).inOrder()
+            assertThat(rig.commands().first().parameter(1)).isEqualTo(1L) // NonAF
+        }
+
+    @Test
+    fun `release falls back to RemoteRelease when On-Off is unsupported`() =
+        runTest {
+            val rig = Rig()
+            // C-02: a failed half-press is swallowed and the full press still runs.
+            // The fallback only fires when the *shutter* opcode is unsupported.
+            rig.fail(PtpResponse.OPERATION_NOT_SUPPORTED)
+            rig.fail(PtpResponse.OPERATION_NOT_SUPPORTED)
+            rig.ok()
+
+            rig.capture.release(EosCapture.ReleaseMode.WITH_AUTOFOCUS)
+
+            assertThat(rig.commands().map { it.code }).contains(CanonEosOperation.REMOTE_RELEASE)
+        }
+
+    /**
+     * A full-press that fails for a non-busy reason used to skip RemoteReleaseOff, leaving
+     * AF virtually held. The next shot then stayed DeviceBusy until the body was power-cycled.
+     */
+    @Test
+    fun `failed full press still releases the AF half-press`() = runTest {
+        val rig = Rig()
+        rig.ok() // half-press
+        rig.fail(PtpResponse.ACCESS_DENIED) // full-press
+        rig.ok() // half-press off in finally
+
+        var thrown: PtpException.OperationFailed? = null
+        try {
+            rig.capture.release(EosCapture.ReleaseMode.WITH_AUTOFOCUS)
+        } catch (e: PtpException.OperationFailed) {
+            thrown = e
+        }
+        assertThat(thrown?.responseCode).isEqualTo(PtpResponse.ACCESS_DENIED)
 
         val sequence = rig.commands().map { it.code to it.parameter(0) }
         assertThat(sequence).containsExactly(
-            CanonEosOperation.REMOTE_RELEASE_ON to 2L,
-            CanonEosOperation.REMOTE_RELEASE_OFF to 2L,
+            CanonEosOperation.REMOTE_RELEASE_ON to 1L,
+            CanonEosOperation.REMOTE_RELEASE_ON to 3L,
+            CanonEosOperation.REMOTE_RELEASE_OFF to 1L,
         ).inOrder()
     }
 
+    /**
+     * When Completely+AF stays DeviceBusy, retry Completely NonAF with the half-press
+     * still held — matching EDSDK `ShutterButton_Completely_NonAF`. Dropping AF and
+     * sending full-press `2` is what kept this body busy with no photo (2026-08-20).
+     */
     @Test
-    fun `release falls back to RemoteRelease when On-Off is unsupported`() = runTest {
+    fun `busy full press after AF falls back to a no-AF shutter`() = runTest {
         val rig = Rig()
-        rig.fail(PtpResponse.OPERATION_NOT_SUPPORTED)
-        rig.ok()
+        rig.ok() // half-press
+        repeat(5) { rig.fail(PtpResponse.DEVICE_BUSY) } // Completely + AF
+        rig.ok() // Completely NonAF
+        rig.ok() // release full
+        rig.ok() // release half
 
         rig.capture.release(EosCapture.ReleaseMode.WITH_AUTOFOCUS)
 
-        assertThat(rig.commands().map { it.code }).contains(CanonEosOperation.REMOTE_RELEASE)
+        val sequence = rig.commands().map { it.code to it.parameter(0) }
+        assertThat(sequence).containsExactly(
+            CanonEosOperation.REMOTE_RELEASE_ON to 1L,
+            CanonEosOperation.REMOTE_RELEASE_ON to 3L,
+            CanonEosOperation.REMOTE_RELEASE_ON to 3L,
+            CanonEosOperation.REMOTE_RELEASE_ON to 3L,
+            CanonEosOperation.REMOTE_RELEASE_ON to 3L,
+            CanonEosOperation.REMOTE_RELEASE_ON to 3L,
+            CanonEosOperation.REMOTE_RELEASE_ON to 3L,
+            CanonEosOperation.REMOTE_RELEASE_OFF to 3L,
+            CanonEosOperation.REMOTE_RELEASE_OFF to 1L,
+        ).inOrder()
+        val nonAf = rig.commands().last { it.code == CanonEosOperation.REMOTE_RELEASE_ON }
+        assertThat(nonAf.parameter(1)).isEqualTo(1L)
+    }
+
+    /**
+     * With no AF held the first full press is already NonAF, so there is no second,
+     * different attempt to make. Retrying it anyway burned a whole extra ~7.5s busy
+     * budget on the operation that had just failed - ~15s of the guest staring at a
+     * booth that had already given up.
+     */
+    @Test
+    fun `busy full press without AF does not retry the same NonAF press`() = runTest {
+        val rig = Rig()
+        val busyMaxAttempts = 12 // EosCapture.BUSY_MAX_ATTEMPTS (private companion)
+        repeat(busyMaxAttempts) { rig.fail(PtpResponse.DEVICE_BUSY) }
+
+        var thrown: PtpException.OperationFailed? = null
+        try {
+            rig.capture.release(EosCapture.ReleaseMode.WITHOUT_AUTOFOCUS)
+        } catch (e: PtpException.OperationFailed) {
+            thrown = e
+        }
+        assertThat(thrown?.responseCode).isEqualTo(PtpResponse.DEVICE_BUSY)
+
+        val fullPresses = rig.commands().filter {
+            it.code == CanonEosOperation.REMOTE_RELEASE_ON
+        }
+        assertThat(fullPresses).hasSize(busyMaxAttempts)
+        assertThat(fullPresses.map { it.parameter(0) }.toSet()).containsExactly(3L)
+        // Nothing engaged, so the finally block must not un-press anything.
+        assertThat(rig.commands().map { it.code })
+            .doesNotContain(CanonEosOperation.REMOTE_RELEASE_OFF)
     }
 
     // ================================================================ download
@@ -320,9 +427,10 @@ class EosCaptureTest {
         val rig = Rig()
         rig.dataThenOk(CanonEosOperation.GET_PARTIAL_OBJECT, ByteArray(0))
 
-        val error = assertThrows(PtpException.Malformed::class.java) {
-            rig.capture.download(1, 5000)
-        }
+        val error =
+            assertThrows(PtpException.Malformed::class.java) {
+                rig.capture.download(1, 5000)
+            }
         assertThat(error.message).contains("empty chunk")
     }
 
@@ -331,9 +439,10 @@ class EosCaptureTest {
         val rig = Rig()
         rig.ok() // response with no data
 
-        val error = assertThrows(PtpException.Malformed::class.java) {
-            rig.capture.download(1, 1000)
-        }
+        val error =
+            assertThrows(PtpException.Malformed::class.java) {
+                rig.capture.download(1, 1000)
+            }
         assertThat(error.message).contains("no data")
     }
 

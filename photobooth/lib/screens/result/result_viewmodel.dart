@@ -14,12 +14,21 @@ import '../../services/print_service.dart';
 import '../../services/print_file.dart';
 import '../../services/print_service_helpers.dart';
 import '../../services/receipt/receipt_print_bridge.dart';
+import '../../services/receipt/local_receipt_assemble.dart';
+import '../../services/receipt/local_receipt_escpos.dart';
 import '../../services/receipt_printer_payload.dart';
+import '../../models/receipt_merchant_cache.dart';
+import '../../services/local_kiosk_store.dart';
+import '../../services/local_kiosk_settlement.dart';
 import '../../services/session_manager.dart';
+import '../../services/local_session_skeleton.dart';
+import '../../services/offline_operator_pin_store.dart';
 import '../../models/session_print_receipt_result.dart';
 import '../../services/share_service.dart';
 import '../../services/kiosk_manager.dart';
+import '../../utils/app_config.dart';
 import '../../utils/app_strings.dart';
+import '../../utils/offline_cash_confirm.dart';
 import '../../utils/receipt_printer_config.dart';
 import '../../utils/constants.dart';
 import '../../utils/exceptions.dart';
@@ -29,6 +38,7 @@ import '../../utils/print_orientation.dart';
 import '../../utils/print_progress_helpers.dart';
 import '../../utils/print_size_helpers.dart';
 import '../../utils/error_reporting_helpers.dart';
+import '../../utils/kiosk_offline_ux.dart';
 import '../../services/error_reporting/error_reporting_manager.dart';
 import '../../services/fcm_service.dart';
 import '../../services/payment_push_coordinator.dart';
@@ -37,6 +47,7 @@ import '../../models/customer_contact_capture.dart';
 import '../../models/kiosk_share_link_model.dart';
 import '../../models/session_discount.dart';
 import '../../models/payment_initiate_result.dart';
+import '../../models/payment_mode.dart';
 import 'kiosk_receipt_share_fallback.dart';
 import 'result_payment_poll_helpers.dart';
 import 'result_viewmodel_share_helpers.dart';
@@ -81,6 +92,7 @@ class ResultViewModel extends ChangeNotifier with _ResultViewModelImpl {
   final PhotoModel? _originalPhoto;
   final PrintOrientation _printOrientation;
   final String? _printSizeOverride;
+  final int? _classicComposeShotCount;
   final PrintService _printService;
   final ShareService _shareService;
   final ApiService _apiService;
@@ -142,10 +154,14 @@ class ResultViewModel extends ChangeNotifier with _ResultViewModelImpl {
   int _paymentIdConsecutiveFailureTicks = 0;
   int _sessionConsecutiveFailureTicks = 0;
   bool _paymentOutcomeHandled = false;
+  bool _sessionPollFallback = false;
 
   /// Set when an FCM payment push is handled on the Pay & Collect screen (inline UI, no dialog).
   String? _fcmPaymentStatusDetail;
   bool? _fcmPaymentPushSuccess;
+
+  /// Settled offline cash waiting for sheet dismiss before Pay→QR navigation.
+  OfflineCashConfirmResult? _pendingOfflineCashApproval;
 
   bool _postPaymentSharePrepared = false;
   Future<void>? _postPaymentInflight;
@@ -194,6 +210,19 @@ class ResultViewModel extends ChangeNotifier with _ResultViewModelImpl {
         paymentLink: _paymentLink,
       );
 
+  bool get cashOnlyOffline => _sessionManager.isOfflineSession;
+
+  /// Event / payments-off kiosks: cash at the counter instead of UPI.
+  bool _collectsCounterCash = false;
+
+  bool get collectsCounterCash => _collectsCounterCash || cashOnlyOffline;
+
+  void setCollectsCounterCash(bool value) {
+    if (_collectsCounterCash == value) return;
+    _collectsCounterCash = value;
+    notifyListeners();
+  }
+
   /// Stops payment/session polling (e.g. before customer deletes photos).
   void stopPaymentPolling() {
     _paymentIdPollTimer?.cancel();
@@ -222,15 +251,15 @@ class ResultViewModel extends ChangeNotifier with _ResultViewModelImpl {
   String? get fcmPaymentStatusDetail => _fcmPaymentStatusDetail;
   bool? get fcmPaymentPushSuccess => _fcmPaymentPushSuccess;
 
-  /// Client-only UX fallback: polling appears "stuck" (consecutive failures)
-  /// for roughly 30 seconds on both payment status and session polling.
-  bool get isDeadPollingFallbackVisible {
-    if (_paymentOutcomeHandled) return false;
-    if (_fcmPaymentPushSuccess != null) return false;
-    // Poll interval is 3s; 10 consecutive failures ≈ 30s.
-    return _paymentIdConsecutiveFailureTicks >= 10 &&
-        _sessionConsecutiveFailureTicks >= 10;
-  }
+  /// Client-only UX fallback when the active backup poller keeps failing.
+  bool get isDeadPollingFallbackVisible => isPaymentPollDead(
+        outcomeHandled: _paymentOutcomeHandled,
+        fcmPaymentPushSuccess: _fcmPaymentPushSuccess,
+        paymentId: _activePaymentId,
+        sessionFallback: _sessionPollFallback,
+        paymentStatusFailures: _paymentIdConsecutiveFailureTicks,
+        sessionFailures: _sessionConsecutiveFailureTicks,
+      );
 
   bool get hasFcmPaymentStatus =>
       _fcmPaymentStatusDetail != null && _fcmPaymentStatusDetail!.isNotEmpty;
@@ -307,6 +336,7 @@ class ResultViewModel extends ChangeNotifier with _ResultViewModelImpl {
     PhotoModel? originalPhoto,
     PrintOrientation printOrientation = PrintOrientation.portrait,
     String? printSize,
+    int? classicComposeShotCount,
     PrintService? printService,
     ShareService? shareService,
     ApiService? apiService,
@@ -323,6 +353,7 @@ class ResultViewModel extends ChangeNotifier with _ResultViewModelImpl {
         _printOrientation = printOrientation,
         _printSizeOverride =
             (printSize?.trim().isNotEmpty ?? false) ? printSize!.trim() : null,
+        _classicComposeShotCount = classicComposeShotCount,
         _printService = printService ?? PrintService(),
         _shareService = shareService ?? ShareService(),
         _apiService = apiService ?? ApiService(),
@@ -450,7 +481,7 @@ class ResultViewModel extends ChangeNotifier with _ResultViewModelImpl {
       await unapplyCoupon();
       return;
     }
-    if (checkoutAmount <= 0) {
+    if (checkoutAmount <= 0 && !collectsCounterCash) {
       _paymentLink = null;
       _qrImageUrl = null;
       _upiLink = null;

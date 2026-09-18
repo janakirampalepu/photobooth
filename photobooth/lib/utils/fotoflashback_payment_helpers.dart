@@ -6,6 +6,7 @@ import '../screens/fotoflashback/surprise_me_upsell_view.dart';
 import '../screens/photo_generate/photo_generate_viewmodel.dart';
 import '../services/app_settings_manager.dart';
 import '../services/print_selection_coordinator.dart';
+import '../services/session_manager.dart';
 import 'app_strings.dart';
 import 'constants.dart';
 import 'payment_workflow_helpers.dart';
@@ -23,7 +24,8 @@ Future<String?> continueAfterFlashbackLook({
   if (!context.mounted) return AppStrings.flashbackComposeFailed;
 
   final payBefore = paymentsEnabled &&
-      collectPaymentBeforeGeneration(paymentCollectionTiming);
+      collectPaymentBeforeGeneration(paymentCollectionTiming) &&
+      !SessionManager().isOfflineSession;
   if (payBefore) {
     await Navigator.of(context).pushNamed(
       AppConstants.kRoutePrePayment,
@@ -58,6 +60,7 @@ Future<String?> continueAfterFlashbackLook({
     surpriseOffer: offer,
     printSize: stripImage.printSize,
     transformationRunId: viewModel.composeResult?.runId,
+    classicComposeShotCount: viewModel.imageDataUrls.length,
   );
   return null;
 }
@@ -96,6 +99,7 @@ Future<String?> composeFlashbackAfterPrePay({
     surpriseOffer: offer,
     printSize: stripImage.printSize,
     transformationRunId: vm.composeResult?.runId,
+    classicComposeShotCount: vm.imageDataUrls.length,
   );
   return null;
 }
@@ -120,16 +124,20 @@ Future<void> navigateToFlashbackPrintSelection({
   SurpriseMeOfferResult? surpriseOffer,
   String? printSize,
   String? transformationRunId,
+  int? classicComposeShotCount,
 }) async {
   if (!context.mounted) return;
   final size = printSize?.trim();
   final runId = transformationRunId?.trim();
+  final shotCount = classicComposeShotCount;
   final strip = image.copyWith(
     isSelected: true,
-    printSize: image.printSize ??
-        ((size != null && size.isNotEmpty)
-            ? size
-            : AppConstants.kPrintSizeStripDual2x6),
+    printSize: resolveFlashbackCartPrintSize(
+      imagePrintSize: image.printSize,
+      fallbackPrintSize: size,
+      classicComposeShotCount: shotCount,
+      orientation: SessionManager().printOrientation,
+    ),
   );
   final offer = surpriseOffer;
   final surpriseImage = offer?.image;
@@ -150,6 +158,7 @@ Future<void> navigateToFlashbackPrintSelection({
     seedImages: images,
     stripPrintSize: resolvedSize,
     transformationRunId: resolvedRunId,
+    classicComposeShotCount: shotCount,
     fromClassicStrip: true,
   );
   if (surpriseOffer?.choice == SurpriseMeUpsellChoice.exploreMore) {

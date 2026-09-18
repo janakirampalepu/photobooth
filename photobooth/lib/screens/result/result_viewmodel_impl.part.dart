@@ -10,10 +10,19 @@ mixin _ResultViewModelImpl on ChangeNotifier {
   }) async {
     if (_r._paymentInitInProgress && !force) return;
     if (!force && _r._shouldSkipPaymentInitiate()) return;
-    if (_r.checkoutAmount <= 0) return;
+    if (_r.checkoutAmount <= 0 && !_r.collectsCounterCash) return;
     final sessionId = _r._sessionManager.sessionId;
     if (sessionId == null || sessionId.isEmpty) {
       _r._paymentInitError = 'No session for payment. Go back and try again.';
+      notifyListeners();
+      return;
+    }
+    if (KioskOfflineUx.shouldUseCashOnlyPayments(
+      sessionOffline: _r._sessionManager.isOfflineSession,
+    )) {
+      _r._paymentInitInProgress = false;
+      _r._paymentInitError = null;
+      _startSessionApprovalPolling(sessionId);
       notifyListeners();
       return;
     }
@@ -34,6 +43,7 @@ mixin _ResultViewModelImpl on ChangeNotifier {
     _r._sessionNullStreak = 0;
     _r._paymentIdConsecutiveFailureTicks = 0;
     _r._sessionConsecutiveFailureTicks = 0;
+    _r._sessionPollFallback = false;
     _r._paymentOutcomeHandled = false;
     notifyListeners();
 
@@ -59,6 +69,19 @@ mixin _ResultViewModelImpl on ChangeNotifier {
       );
       if (generation != _r._paymentInitiateGeneration) return;
       _applyPaymentInitiateResult(result);
+      if (paymentVerdictFromStatusString(result.status) ==
+          PaymentPollVerdict.approved) {
+        _r._paymentInitError = null;
+        await onFcmPaymentPush(
+          PaymentPushPayload(
+            type: PaymentPushCoordinator.typeApproved,
+            paymentId: result.id,
+            title: AppStrings.paymentConfirmedTitle,
+            body: 'Payment approved. Printing...',
+          ),
+        );
+        return;
+      }
       if (kDebugMode) {
         AppLogger.debug(
           'Payment initiate OK: id=${result.id} status=${result.status} '
@@ -66,7 +89,9 @@ mixin _ResultViewModelImpl on ChangeNotifier {
           'link=${_r._paymentLink != null}',
         );
       }
-      if (!_r.hasPaymentQrPayload &&
+      final counterCash = _isCounterCashInitiate(result);
+      if (!counterCash &&
+          !_r.hasPaymentQrPayload &&
           _r._activePaymentId != null &&
           _r._paymentInitiateAttempts < 1) {
         _r._paymentInitiateAttempts += 1;
@@ -76,19 +101,34 @@ mixin _ResultViewModelImpl on ChangeNotifier {
         if (_r._disposed) return;
         return loadPaymentQr(customerPhone: customerPhone, force: true);
       }
-      if (!_r.hasPaymentQrPayload) {
+      if (!counterCash && !_r.hasPaymentQrPayload) {
         _r._paymentInitError =
             'Could not load UPI QR from the server. Tap Retry below or ask staff.';
       } else {
         _r._paymentInitError = null;
       }
-      if (_r._activePaymentId != null) {
-        _startPaymentStatusPolling();
-      }
-      _startSessionApprovalPolling(sessionId);
+      _startPaymentApprovalPolling(sessionId);
     } on ApiException catch (e) {
+      if (KioskOfflineUx.shouldUseCashOnlyPayments(
+        sessionOffline: false,
+        error: e,
+      )) {
+        _r._sessionManager.markSessionOffline();
+        _r._paymentInitError = null;
+        _startSessionApprovalPolling(sessionId);
+        return;
+      }
       _r._paymentInitError = e.message;
     } catch (e, st) {
+      if (KioskOfflineUx.shouldUseCashOnlyPayments(
+        sessionOffline: false,
+        error: e,
+      )) {
+        _r._sessionManager.markSessionOffline();
+        _r._paymentInitError = null;
+        _startSessionApprovalPolling(sessionId);
+        return;
+      }
       _r._paymentInitError = 'Payment setup failed: $e';
       unawaited(
         reportIssue(
@@ -112,6 +152,9 @@ mixin _ResultViewModelImpl on ChangeNotifier {
     return _r.hasPaymentQrPayload;
   }
 
+  bool _isCounterCashInitiate(PaymentInitiateResult result) =>
+      _r.collectsCounterCash || result.paymentMode == PaymentMode.cash;
+
   void _applyPaymentInitiateResult(PaymentInitiateResult result) {
     _r._paymentLink = result.paymentLink;
     _r._qrImageUrl = result.qrImageUrl;
@@ -124,6 +167,13 @@ mixin _ResultViewModelImpl on ChangeNotifier {
   }
 
   Future<void> applyCoupon(String code) async {
+    if (KioskOfflineUx.shouldHideCloudDiscounts(
+      sessionOffline: _r._sessionManager.isOfflineSession,
+    )) {
+      _r._couponError = AppStrings.offlineGiftCardUnavailable;
+      notifyListeners();
+      return;
+    }
     final sessionId = _r._sessionManager.sessionId;
     if (sessionId == null || sessionId.isEmpty) {
       _r._couponError = 'No session for coupon';
@@ -184,7 +234,6 @@ mixin _ResultViewModelImpl on ChangeNotifier {
     }
   }
 
-
   void _applyQrFieldsFromPollMap(Map<String, dynamic> raw) {
     if (_r.hasPaymentQrPayload) return;
     final parsed = PaymentInitiateResult.fromJson(raw);
@@ -207,8 +256,15 @@ mixin _ResultViewModelImpl on ChangeNotifier {
     }
   }
 
-  /// Kiosk polling backup cadence: every 3 seconds.
-  static const _paymentPollInterval = Duration(seconds: 3);
+  void _startPaymentApprovalPolling(String sessionId) {
+    _r.stopPaymentPolling();
+    _r._sessionPollFallback = false;
+    if (shouldPollPaymentStatus(_r._activePaymentId)) {
+      _startPaymentStatusPolling();
+      return;
+    }
+    _startSessionApprovalPolling(sessionId);
+  }
 
   void _startPaymentStatusPolling() {
     _r._paymentIdPollTimer?.cancel();
@@ -216,7 +272,7 @@ mixin _ResultViewModelImpl on ChangeNotifier {
     _r._paymentIdNullStreak = 0;
     _r._paymentIdConsecutiveFailureTicks = 0;
     _r._paymentIdPollTimer = Timer.periodic(
-      _paymentPollInterval,
+      kPaymentPollInterval,
       _onPaymentPollTick,
     );
   }
@@ -227,7 +283,7 @@ mixin _ResultViewModelImpl on ChangeNotifier {
     _r._sessionNullStreak = 0;
     _r._sessionConsecutiveFailureTicks = 0;
     _r._sessionPollTimer = Timer.periodic(
-      _paymentPollInterval,
+      kPaymentPollInterval,
       (t) => _onSessionPollTick(t, sessionId),
     );
   }
@@ -237,8 +293,7 @@ mixin _ResultViewModelImpl on ChangeNotifier {
       t.cancel();
       return;
     }
-    if (++_r._sessionPollTicks > 180) {
-      // 12 minutes max.
+    if (++_r._sessionPollTicks > kPaymentPollMaxTicks) {
       t.cancel();
       return;
     }
@@ -249,6 +304,7 @@ mixin _ResultViewModelImpl on ChangeNotifier {
     } catch (_) {
       raw = null;
     }
+    raw ??= await LocalKioskStore.instance?.getSession(sessionId);
     if (_r._disposed) {
       t.cancel();
       return;
@@ -262,7 +318,9 @@ mixin _ResultViewModelImpl on ChangeNotifier {
         // Keep polling, but allow UI to surface a "stuck" fallback.
       }
       _r._sessionConsecutiveFailureTicks += 1;
-      if (_r._sessionConsecutiveFailureTicks == 10) notifyListeners();
+      if (_r._sessionConsecutiveFailureTicks == kPaymentPollDeadFailureTicks) {
+        notifyListeners();
+      }
       return;
     }
     _r._sessionNullStreak = 0;
@@ -303,7 +361,7 @@ mixin _ResultViewModelImpl on ChangeNotifier {
       t.cancel();
       return;
     }
-    if (++_r._paymentIdPollTicks > 90) {
+    if (++_r._paymentIdPollTicks > kPaymentPollMaxTicks) {
       t.cancel();
       return;
     }
@@ -336,7 +394,10 @@ mixin _ResultViewModelImpl on ChangeNotifier {
         // Keep polling, but allow UI to surface a "stuck" fallback.
       }
       _r._paymentIdConsecutiveFailureTicks += 1;
-      if (_r._paymentIdConsecutiveFailureTicks == 10) notifyListeners();
+      if (_r._paymentIdConsecutiveFailureTicks ==
+          kPaymentPollDeadFailureTicks) {
+        notifyListeners();
+      }
       return;
     }
     _r._paymentIdNullStreak = 0;
@@ -368,7 +429,15 @@ mixin _ResultViewModelImpl on ChangeNotifier {
         );
       case PaymentPollVerdict.pending:
       case null:
-        break;
+        final fallbackSessionId = sessionIdForPaymentStatusFallback(
+          paymentStatusTicks: _r._paymentIdPollTicks,
+          sessionId: _r._sessionManager.sessionId,
+        );
+        if (fallbackSessionId != null) {
+          t.cancel();
+          _r._sessionPollFallback = true;
+          _startSessionApprovalPolling(fallbackSessionId);
+        }
     }
   }
 
@@ -433,21 +502,91 @@ mixin _ResultViewModelImpl on ChangeNotifier {
     }
     if (_r._disposed) return;
 
-    _startSessionApprovalPolling(sessionId);
-    if (_r._activePaymentId != null && _r._activePaymentId!.trim().isNotEmpty) {
-      _startPaymentStatusPolling();
-    }
+    _startPaymentApprovalPolling(sessionId);
   }
 
   /// Free checkout (payments disabled on kiosk): print immediately after BEHOLD.
   Future<void> onFreeCheckoutPrint() async {
     _r._fcmPaymentPushSuccess = true;
-    _r._fcmPaymentStatusDetail = kIsWeb
-        ? 'Preparing your photos…'
-        : 'Printing your photos…';
+    _r._fcmPaymentStatusDetail =
+        kIsWeb ? 'Preparing your photos…' : 'Printing your photos…';
     _r.enterGuestQrShareMode();
     notifyListeners();
     await startPostPaymentPrintIfNeeded();
+  }
+
+  /// Offline Pay: staff PIN → local CASH ledger only.
+  ///
+  /// Does **not** start print/share/navigation — call [publishOfflineCashApproval]
+  /// after the PIN sheet is dismissed so the modal does not race Scan & Share.
+  Future<bool> confirmOfflineCashReceived({
+    String pin = '',
+    bool skipPin = false,
+  }) async {
+    if (!_r.cashOnlyOffline) {
+      _r._errorMessage = AppStrings.offlineCashConfirmFailed;
+      notifyListeners();
+      return false;
+    }
+    if (_r._paymentOutcomeHandled || _r._fcmPaymentPushSuccess == true) {
+      return true;
+    }
+    if (_r._pendingOfflineCashApproval != null) {
+      return true;
+    }
+    if (!skipPin) {
+      final ok = await OfflineOperatorPinStore.verifyPin(pin);
+      if (!ok) {
+        _r._errorMessage = AppStrings.offlineCashConfirmBadPin;
+        notifyListeners();
+        return false;
+      }
+    }
+    try {
+      final settled = await settleOfflineCashForCurrentSession(
+        amountRupees: _r.chargeAmount,
+        sessionManager: _r._sessionManager,
+      );
+      _r._pendingOfflineCashApproval = settled;
+      _r._errorMessage = null;
+      notifyListeners();
+      return true;
+    } on ApiException catch (e) {
+      _r._errorMessage = e.message;
+      notifyListeners();
+      return false;
+    } catch (e, st) {
+      _r._errorMessage = AppStrings.offlineCashConfirmFailed;
+      notifyListeners();
+      unawaited(
+        reportIssue(
+          'Offline cash confirm failed',
+          e,
+          st,
+          extraInfo: {'source': 'offline_cash_confirm'},
+        ),
+      );
+      return false;
+    }
+  }
+
+  /// After the PIN sheet pops: mark paid, navigate, print/share in background.
+  Future<void> publishOfflineCashApproval() async {
+    final settled = _r._pendingOfflineCashApproval;
+    if (settled == null) {
+      if (_r._fcmPaymentPushSuccess == true) return;
+      return;
+    }
+    _r._pendingOfflineCashApproval = null;
+    await onFcmPaymentPush(
+      PaymentPushPayload(
+        type: PaymentPushCoordinator.typeApproved,
+        paymentId: settled.paymentId,
+        amount: '${settled.amountRupees}',
+        title: AppStrings.paymentConfirmedTitle,
+        body: 'Cash received. Printing...',
+      ),
+    );
   }
 
   /// Starts the first post-payment print once (native kiosk with printer enabled).
@@ -597,13 +736,24 @@ mixin _ResultViewModelImpl on ChangeNotifier {
   ///
   /// Waits for an in-flight silent print first so multi-page jobs are not aborted
   /// mid-cart when QR share idle-exits (temp files deleted under the printer).
-  Future<void> privacyWipeLocal() async {
+  ///
+  /// Pass [waitForPrint] false for guest Start again / close — LAN print can
+  /// block the CTA for minutes and looks like a dead button.
+  Future<void> privacyWipeLocal({bool waitForPrint = true}) async {
+    final sessionId = _r._sessionManager.sessionId;
     _r.stopPaymentPolling();
     stopWhatsappDeliveryPolling();
-    await _awaitSilentPrintInflight();
+    if (waitForPrint) {
+      await _awaitSilentPrintInflight();
+    }
     _r._downloadedFiles.clear();
-    await endPhotoboothCustomerSessionLogged('result: privacyWipeLocal');
-    await FileHelper.cleanupTempImages();
+    await endPhotoboothCustomerSessionLogged(
+      'result: privacyWipeLocal',
+      onlyIfId: sessionId,
+    );
+    if (!_r._sessionManager.hasSession) {
+      await FileHelper.cleanupTempImages();
+    }
   }
 
   static String? _firstNonEmptyString(dynamic v) {
@@ -845,6 +995,12 @@ mixin _ResultViewModelImpl on ChangeNotifier {
       return;
     }
 
+    // Offline sessions must not wait on Fly mint/receipt (Dio can sit ~5 min).
+    if (_r._sessionManager.isOfflineSession) {
+      await _runOfflinePostPaymentShareArtifacts(sessionId);
+      return;
+    }
+
     await _mintKioskFallbackForPostPayment();
     if (_r._disposed) return;
 
@@ -867,6 +1023,57 @@ mixin _ResultViewModelImpl on ChangeNotifier {
 
     _r._postPaymentSharePrepared = true;
     await refreshWhatsappDeliveryStatusFromSession();
+    notifyListeners();
+  }
+
+  /// Local share URL + invoice; the Fly receipt POST runs short in background.
+  Future<void> _runOfflinePostPaymentShareArtifacts(String sessionId) async {
+    // Offline V2-4: publish the QR before receipt or upload work.
+    final shareToken = await _r._sessionManager.ensureShareToken();
+    if (_r._disposed) return;
+    if (shareToken != null && shareToken.isNotEmpty) {
+      _r._receiptShareUrl = AppConfig.shareUrlForToken(shareToken);
+      _r._receiptShareLongUrl = AppConfig.shareLongUrlForToken(shareToken);
+      notifyListeners();
+    }
+
+    try {
+      await _issueLocalReceipt(sessionId).timeout(const Duration(seconds: 8));
+    } catch (e, st) {
+      AppLogger.debug('Offline local receipt timed out/failed: $e\n$st');
+    }
+    if (_r._disposed) return;
+
+    if (_r.isReceiptPrinterConfigured && !_r._postPaymentReceiptPrintStarted) {
+      _r._postPaymentReceiptPrintStarted = true;
+      unawaited(printReceiptToNetwork(showErrors: false));
+    }
+
+    unawaited(_tryOfflineReceiptInBackground(sessionId));
+
+    _r._postPaymentSharePrepared = true;
+    notifyListeners();
+  }
+
+  Future<void> _tryOfflineReceiptInBackground(String sessionId) async {
+    try {
+      await _postSessionReceiptForPostPayment(sessionId)
+          .timeout(const Duration(seconds: 12));
+    } catch (_) {}
+    if (_r._disposed) return;
+    applyKioskFallbackWhenReceiptShareEmpty(
+      KioskReceiptShareFallback(
+        receiptShareUrl: _r._receiptShareUrl,
+        kioskFallbackShareUrl: _r._kioskFallbackShareUrl,
+        setReceiptShareUrl: (u) => _r._receiptShareUrl = u,
+        receiptShareLongUrl: _r._receiptShareLongUrl,
+        kioskFallbackShareLongUrl: _r._kioskFallbackShareLongUrl,
+        setReceiptShareLongUrl: (u) => _r._receiptShareLongUrl = u,
+        receiptShareExpiresAt: _r._receiptShareExpiresAt,
+        kioskFallbackShareExpiresAt: _r._kioskFallbackShareExpiresAt,
+        setReceiptShareExpiresAt: (t) => _r._receiptShareExpiresAt = t,
+      ),
+    );
     notifyListeners();
   }
 
@@ -935,6 +1142,7 @@ mixin _ResultViewModelImpl on ChangeNotifier {
     Object? lastError;
     StackTrace? lastStack;
     int? lastStatus;
+    final local = await _issueLocalReceipt(sessionId);
 
     for (var attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
@@ -950,6 +1158,8 @@ mixin _ResultViewModelImpl on ChangeNotifier {
           transactionRef: _r._activePaymentId,
           fcmToken: fcmToken,
           printQuantity: _r.printSheetCount,
+          receiptNumber: local?.receiptNumber,
+          receiptId: local?.id,
         );
       } on ApiException catch (e, st) {
         lastError = e;
@@ -998,7 +1208,52 @@ mixin _ResultViewModelImpl on ChangeNotifier {
         'maxAttempts': maxAttempts,
       },
     );
+    final err = lastError;
+    if (local != null && err != null && isWanDownSessionError(err)) {
+      return local.json;
+    }
     return null;
+  }
+
+  Future<LocalReceiptIssue?> _issueLocalReceipt(String sessionId) async {
+    final store = LocalKioskStore.instance;
+    if (store == null) return null;
+    try {
+      final kioskCode = await _r._kioskManager.getKioskCode();
+      final merchant = _r._appSettingsManager?.settings?.receiptMerchant;
+      return LocalKioskSettlement(store: store).issueReceipt(
+        sessionId: sessionId,
+        kioskCode: kioskCode,
+        amount: _r.chargeAmount,
+        merchant: merchant,
+        quantity: _r.printSheetCount,
+      );
+    } catch (e, st) {
+      AppLogger.debug('Local receipt issue failed ($e)');
+      AppLogger.debug('$st');
+      return null;
+    }
+  }
+
+  Future<void> _recordLocalPrintJobs() async {
+    final store = LocalKioskStore.instance;
+    final sessionId = _r._sessionManager.sessionId;
+    if (store == null || sessionId == null || sessionId.trim().isEmpty) {
+      return;
+    }
+    try {
+      final settlement = LocalKioskSettlement(store: store);
+      for (final image in _r._generatedImages) {
+        await settlement.recordPrintJob(
+          sessionId: sessionId,
+          imageUrl: image.imageUrl,
+          copies: _r._printCopies,
+        );
+      }
+    } catch (e, st) {
+      AppLogger.debug('Local print job record failed ($e)');
+      AppLogger.debug('$st');
+    }
   }
 
   /// Mints a short-lived customer share link for this session (for QR bridge).
@@ -1101,7 +1356,10 @@ mixin _ResultViewModelImpl on ChangeNotifier {
           'Failed to download images for print/share',
           e,
           st,
-          extraInfo: {'source': 'result_download_images', 'forAction': forAction},
+          extraInfo: {
+            'source': 'result_download_images',
+            'forAction': forAction
+          },
         ),
       );
       _r._isDownloading = false;
@@ -1208,6 +1466,8 @@ mixin _ResultViewModelImpl on ChangeNotifier {
 
   /// Fetch ESC/POS from API and deliver to the LAN thermal receipt printer.
   ///
+  /// Offline sessions (and Fly failures) use the same GST slip format built
+  /// on-device from the kiosk invoice number + cached `receiptMerchant`.
   /// When [showErrors] is false (auto post-payment), failures are logged only.
   Future<bool> printReceiptToNetwork({bool showErrors = true}) async {
     if (_r._isPrintingReceipt) return false;
@@ -1246,46 +1506,43 @@ mixin _ResultViewModelImpl on ChangeNotifier {
     }
 
     try {
-      final raw = await _r._apiService.postSessionPrintReceipt(
-        sessionId: sessionId,
-      );
-      if (_r._disposed) return false;
+      if (_r._sessionManager.isOfflineSession) {
+        return await _printLocalGstReceipt(showErrors: showErrors);
+      }
 
-      final result = SessionPrintReceiptResult.fromJson(raw);
-      if (!result.success || !result.printerConfigured) {
-        final msg =
-            result.error ??
-            result.message ??
-            AppStrings.receiptPrintNotConfigured;
-        if (showErrors) {
-          _r._errorMessage = msg;
-        } else {
-          AppLogger.warning('Receipt print skipped: $msg');
+      try {
+        final raw = await _r._apiService.postSessionPrintReceipt(
+          sessionId: sessionId,
+        );
+        if (_r._disposed) return false;
+
+        final result = SessionPrintReceiptResult.fromJson(raw);
+        if (result.success && result.printerConfigured) {
+          if (result.deliveredByServer) {
+            AppLogger.debug('Receipt delivered by server; skipping LAN TCP');
+            return true;
+          }
+          if (result.needsLanDelivery) {
+            await _r._receiptPrintBridge.deliverEscPos(
+              bytes: ReceiptPrinterPayload.decodeBase64(result.payloadBase64!),
+              settings: _r._appSettingsManager?.settings,
+              apiHost: result.host,
+              apiPort: result.port,
+            );
+            return true;
+          }
         }
-        return false;
+        AppLogger.warning(
+          'Fly receipt print unavailable; trying local GST slip',
+        );
+      } catch (e, st) {
+        AppLogger.debug('Fly receipt print failed; trying local: $e\n$st');
       }
 
-      if (result.deliveredByServer) {
-        AppLogger.debug('Receipt delivered by server; skipping LAN TCP');
-        return true;
-      }
-
-      if (!result.needsLanDelivery) {
-        if (showErrors) {
-          _r._errorMessage = AppStrings.receiptPrintEmptyPayload;
-        }
-        return false;
-      }
-
-      await _r._receiptPrintBridge.deliverEscPos(
-        bytes: ReceiptPrinterPayload.decodeBase64(result.payloadBase64!),
-        settings: _r._appSettingsManager?.settings,
-        apiHost: result.host,
-        apiPort: result.port,
-      );
-      return true;
+      return await _printLocalGstReceipt(showErrors: showErrors);
     } catch (e, st) {
-      AppLogger.error('printReceiptToNetwork failed: $e', error: e, stackTrace: st);
+      AppLogger.error('printReceiptToNetwork failed: $e',
+          error: e, stackTrace: st);
       if (showErrors) {
         _r._errorMessage = e is ApiException
             ? e.userFacingMessage
@@ -1302,6 +1559,60 @@ mixin _ResultViewModelImpl on ChangeNotifier {
         }
       }
     }
+  }
+
+  Future<bool> _printLocalGstReceipt({required bool showErrors}) async {
+    final store = LocalKioskStore.instance;
+    final sessionId = _r._sessionManager.sessionId?.trim() ?? '';
+    if (store == null || sessionId.isEmpty) {
+      if (showErrors) {
+        _r._errorMessage = AppStrings.receiptPrintFailedGeneric;
+      }
+      return false;
+    }
+
+    final merchant = _r._appSettingsManager?.settings?.receiptMerchant ??
+        const ReceiptMerchantCache(displayName: 'FotoZen.AI');
+    var local = await _issueLocalReceipt(sessionId);
+    if (local == null) {
+      final row = await store.findReceiptForSession(sessionId);
+      if (row != null) {
+        local = LocalReceiptIssue(
+          id: row.id,
+          receiptNumber: row.receiptNumber ??
+              (row.payload['receiptNumber']?.toString() ?? ''),
+          json: Map<String, dynamic>.from(row.payload),
+          pdfPath: row.payload['pdfPath'] as String?,
+        );
+      }
+    }
+    if (local == null || local.receiptNumber.trim().isEmpty) {
+      if (showErrors) {
+        _r._errorMessage = AppStrings.receiptPrintFailedGeneric;
+      } else {
+        AppLogger.warning('Local GST receipt missing invoice number');
+      }
+      return false;
+    }
+
+    final share = _r._receiptShareUrl?.trim().isNotEmpty == true
+        ? _r._receiptShareUrl
+        : _r._kioskFallbackShareUrl;
+    final slip = assembleLocalReceiptSlip(
+      receipt: local,
+      merchant: merchant,
+      quantity: _r.printSheetCount,
+      customerName: _r.customerName,
+      customerPhone: _r.customerPhone,
+      shareUrl: share,
+      transactionRef: _r._activePaymentId,
+    );
+    final bytes = buildLocalReceiptEscPos(slip);
+    await _r._receiptPrintBridge.deliverEscPos(
+      bytes: bytes,
+      settings: _r._appSettingsManager?.settings,
+    );
+    return true;
   }
 
   /// Silent print all images to network printer.
@@ -1332,7 +1643,12 @@ mixin _ResultViewModelImpl on ChangeNotifier {
       return;
     }
 
-    await _r._printService.resetDnpPrintSession();
+    await _r._printService.resetDnpPrintSession().timeout(
+      const Duration(seconds: 8),
+      onTimeout: () {
+        AppLogger.warning('DNP/Selphy session reset timed out after 8s');
+      },
+    );
 
     if (_r._downloadedFilesList.length != _r._generatedImages.length) {
       if (kIsWeb) {
@@ -1405,6 +1721,7 @@ mixin _ResultViewModelImpl on ChangeNotifier {
       } else {
         _r._errorMessage = null;
         _completePrintProgress(totalPages: _r._generatedImages.length);
+        unawaited(_recordLocalPrintJobs());
       }
     } on PrintException catch (e, st) {
       if (shouldApplyPrintFailure(_r._printProgress)) {
@@ -1468,6 +1785,7 @@ mixin _ResultViewModelImpl on ChangeNotifier {
       imagePrintSize: image.printSize,
       orientation: _r._printOrientation,
       sessionOverride: _r._printSizeOverride,
+      classicComposeShotCount: _r._classicComposeShotCount,
     );
     try {
       await _r._printService.printDnpPhoto(

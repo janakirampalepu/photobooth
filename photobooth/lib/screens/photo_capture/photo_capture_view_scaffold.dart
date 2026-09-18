@@ -3,11 +3,10 @@ import 'package:flutter/cupertino.dart' show CupertinoIcons;
 import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform;
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../../utils/app_strings.dart';
+import '../../utils/edge_to_edge.dart';
 import '../../views/widgets/full_screen_loader.dart';
-import '../../views/widgets/leading_with_alice.dart';
 import '../../views/widgets/theme_background.dart';
 import 'photo_capture_strip_thumbs.dart';
 import 'photo_capture_view_layout.dart';
@@ -113,12 +112,7 @@ class PhotoCaptureScaffold extends StatelessWidget {
       surfaceTintColor: Colors.transparent,
       forceMaterialTransparency: true,
       centerTitle: true,
-      systemOverlayStyle: SystemUiOverlayStyle.light.copyWith(
-        statusBarColor: Colors.transparent,
-        systemNavigationBarColor: const Color(0xFF050810),
-        systemNavigationBarIconBrightness: Brightness.light,
-        systemNavigationBarContrastEnforced: false,
-      ),
+      systemOverlayStyle: kEdgeToEdgeOverlayStyle,
       title: const Text(
         'POSE',
         style: TextStyle(
@@ -180,7 +174,6 @@ class PhotoCaptureScaffold extends StatelessWidget {
           ),
           onPressed: _cameraActionsDisabled ? null : onReloadCameras,
         ),
-        const AppBarAliceAction(),
       ],
     );
   }

@@ -8,13 +8,20 @@ import com.srisarani.fotozenai.canon.CanonSidecarService
 import com.srisarani.fotozenai.canon.CanonSidecarStatusMethodChannel
 import com.srisarani.fotozenai.canon.CanonUsbPermissionManager
 import com.srisarani.fotozenai.canoncapture.CanonCameraStack
-import io.flutter.embedding.android.FlutterActivity
+import com.srisarani.fotozenai.eventpipeline.EventCardDetectChannel
+import com.srisarani.fotozenai.eventpipeline.EventFrameCompositor
+import com.srisarani.fotozenai.eventpipeline.EventPipelineService
+import com.srisarani.fotozenai.eventpipeline.EventImageDownscaler
+import com.srisarani.fotozenai.eventpipeline.EventStorageMethodChannel
+import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 
-class MainActivity : FlutterActivity() {
+class MainActivity : FlutterFragmentActivity() {
     private var hardwareKeysHandler: HardwareKeysHandler? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // ComponentActivity is required for enableEdgeToEdge(); FlutterActivity is not one.
+        EdgeToEdgeDisplay.enable(this)
         super.onCreate(savedInstanceState)
         PaymentNotificationChannelSetup.registerIfNeeded(this)
         // Only one Canon stack may touch the camera — see CanonCameraStack. Default is
@@ -41,9 +48,16 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         DisplayMethodChannel.register(flutterEngine, this)
         DeviceMemoryMethodChannel.register(flutterEngine, this)
+        ProcessExitMethodChannel.register(flutterEngine, this)
+        JpegEncodeMethodChannel.register(flutterEngine)
         DnpUsbMethodChannel.register(flutterEngine, this)
         ReceiptUsbMethodChannel.register(flutterEngine, this)
         SelphyMethodChannel.register(flutterEngine, this)
+        EventStorageMethodChannel.register(flutterEngine, this)
+        EventImageDownscaler.register(flutterEngine, this)
+        EventCardDetectChannel.register(flutterEngine, this)
+        EventFrameCompositor.register(flutterEngine, this)
+        EventPipelineService.register(flutterEngine, this)
         // Both channels register regardless: Dart may query either one's status, and a
         // channel with no camera behind it answers "not available" rather than hanging.
         CanonSidecarStatusMethodChannel.register(flutterEngine, this)
@@ -82,7 +96,11 @@ class MainActivity : FlutterActivity() {
         super.onDestroy()
     }
 
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+    override fun onActivityResult(
+        requestCode: Int,
+        resultCode: Int,
+        data: Intent?,
+    ) {
         // The native DSLR capture screen returns its shots this way; anything it does not
         // claim falls through to Flutter's own plugin result handling.
         if (CanonPtpMethodChannel.onActivityResult(requestCode, resultCode, data)) return

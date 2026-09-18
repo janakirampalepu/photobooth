@@ -16,15 +16,21 @@ import '../models/parallel_generation_result.dart';
 import '../models/strip_models.dart';
 import '../screens/result/transformed_image_model.dart';
 import '../screens/theme_selection/theme_model.dart';
+import '../utils/app_strings.dart';
 import '../utils/exceptions.dart';
 import '../utils/constants.dart';
 import '../utils/print_orientation.dart';
 import '../utils/session_user_image_validation.dart';
+import '../utils/secure_image_url.dart';
 import '../utils/logger.dart';
 import '../utils/web_flow_trace.dart';
 import 'api_client.dart';
 import 'api_service_dio.dart';
 import 'client_identification.dart';
+import 'catalog_disk_cache.dart';
+import 'image_cache_service.dart';
+import 'image_cache_source.dart';
+import '../utils/classic_offline_frames.dart';
 import 'api_dio_errors.dart';
 import 'api_http_response.dart';
 import 'generation_api_errors.dart';
@@ -42,8 +48,17 @@ class ApiService {
   late final Dio _dio;
   late final Dio _aiDio;
   final Uuid _uuid = const Uuid();
+  final CatalogDiskCache _catalogDiskCache;
+  final ImageCacheService? _imageCacheService;
 
-  ApiService({Dio? dio, Dio? aiDio}) {
+  ApiService({
+    Dio? dio,
+    Dio? aiDio,
+    CatalogDiskCache? catalogDiskCache,
+    ImageCacheService? imageCacheService,
+  })  : _catalogDiskCache = catalogDiskCache ?? CatalogDiskCache(),
+        _imageCacheService =
+            imageCacheService ?? (dio == null ? ImageCacheService() : null) {
     _dio = dio ?? createProductionApiDio();
     _aiDio = aiDio ?? (dio ?? createAiGenerationDio());
     _apiClient = ApiClient(_dio, baseUrl: AppConstants.kBaseUrl);
@@ -85,7 +100,8 @@ class ApiService {
         ),
       );
       final data = r.data;
-      throwIfHttpErrorResponse(r, operationLabel: 'Failed to create share link');
+      throwIfHttpErrorResponse(r,
+          operationLabel: 'Failed to create share link');
       return parseJsonMapBody(
         data,
         unexpectedMessage: 'Unexpected share link response from API',
@@ -173,6 +189,105 @@ class ApiService {
     }
   }
 
+  /// POST `/api/kiosk/ingest` — insert-once ledger rows from the kiosk outbox.
+  Future<void> ingestKioskEntities({
+    required String kioskCode,
+    required List<Map<String, dynamic>> items,
+  }) async {
+    final code = kioskCode.trim().toUpperCase();
+    if (code.isEmpty) {
+      throw ApiException('kioskCode is required');
+    }
+    try {
+      final r = await _dio.post<dynamic>(
+        '/api/kiosk/ingest',
+        data: <String, dynamic>{'kioskCode': code, 'items': items},
+        options: Options(
+          headers: {'X-Kiosk-Code': code},
+          responseType: ResponseType.json,
+          validateStatus: (c) => c != null && c >= 200 && c < 500,
+        ),
+      );
+      throwIfHttpErrorResponse(r, operationLabel: 'Kiosk ingest failed');
+    } on DioException catch (e) {
+      throwApiExceptionAfterWebCors(
+        e,
+        messagePrefix: 'Kiosk ingest failed',
+      );
+    }
+  }
+
+  /// POST `/api/kiosk/ingest/asset` — idempotent guest JPEG upload.
+  Future<void> ingestKioskAsset({
+    required String kioskCode,
+    required String prefix,
+    required String filename,
+    required List<int> bytes,
+  }) async {
+    final code = kioskCode.trim().toUpperCase();
+    if (code.isEmpty) {
+      throw ApiException('kioskCode is required');
+    }
+    if (bytes.isEmpty) {
+      throw ApiException('asset bytes are required');
+    }
+    try {
+      final r = await _dio.post<dynamic>(
+        '/api/kiosk/ingest/asset',
+        data: <String, dynamic>{
+          'kioskCode': code,
+          'prefix': prefix,
+          'filename': filename,
+          'bytesBase64': base64Encode(bytes),
+        },
+        options: Options(
+          headers: {'X-Kiosk-Code': code},
+          responseType: ResponseType.json,
+          validateStatus: (c) => c != null && c >= 200 && c < 500,
+        ),
+      );
+      throwIfHttpErrorResponse(r, operationLabel: 'Kiosk asset ingest failed');
+    } on DioException catch (e) {
+      throwApiExceptionAfterWebCors(
+        e,
+        messagePrefix: 'Kiosk asset ingest failed',
+      );
+    }
+  }
+
+  /// POST `/api/kiosk/heartbeat` — liveness + historical Android process exits.
+  Future<void> postKioskHeartbeat({
+    required String kioskCode,
+    required String appVersion,
+    List<Map<String, dynamic>> processExits = const [],
+  }) async {
+    final code = kioskCode.trim().toUpperCase();
+    if (code.isEmpty) {
+      throw ApiException('kioskCode is required');
+    }
+    try {
+      final r = await _dio.post<dynamic>(
+        '/api/kiosk/heartbeat',
+        data: <String, dynamic>{
+          'kioskCode': code,
+          'appVersion': appVersion,
+          'processExits': processExits,
+        },
+        options: Options(
+          headers: {'X-Kiosk-Code': code},
+          responseType: ResponseType.json,
+          validateStatus: (c) => c != null && c >= 200 && c < 500,
+        ),
+      );
+      throwIfHttpErrorResponse(r, operationLabel: 'Kiosk heartbeat failed');
+    } on DioException catch (e) {
+      throwApiExceptionAfterWebCors(
+        e,
+        messagePrefix: 'Kiosk heartbeat failed',
+      );
+    }
+  }
+
   /// POST `/api/sessions/:id/receipt` — create/update receipt + optional WhatsApp queue.
   ///
   /// Requires `session.paymentStatus == APPROVED` server-side.
@@ -188,6 +303,8 @@ class ApiService {
     String? transactionRef,
     String? fcmToken,
     int? printQuantity,
+    String? receiptNumber,
+    String? receiptId,
   }) async {
     final sid = sessionId.trim();
     if (sid.isEmpty) {
@@ -209,9 +326,14 @@ class ApiService {
         'marketingWhatsappOptIn': marketingWhatsappOptIn,
       if (transactionRef != null && transactionRef.trim().isNotEmpty)
         'transactionRef': transactionRef.trim(),
-      if (fcmToken != null && fcmToken.trim().isNotEmpty) 'fcmToken': fcmToken.trim(),
+      if (fcmToken != null && fcmToken.trim().isNotEmpty)
+        'fcmToken': fcmToken.trim(),
       if (printQuantity != null && printQuantity >= 1)
         'printQuantity': printQuantity,
+      if (receiptNumber != null && receiptNumber.trim().isNotEmpty)
+        'receiptNumber': receiptNumber.trim(),
+      if (receiptId != null && receiptId.trim().isNotEmpty)
+        'id': receiptId.trim(),
     };
 
     try {
@@ -262,7 +384,8 @@ class ApiService {
         ),
       );
       final data = r.data;
-      throwIfHttpErrorResponse(r, operationLabel: 'Receipt print request failed');
+      throwIfHttpErrorResponse(r,
+          operationLabel: 'Receipt print request failed');
       return parseJsonMapBody(
         data,
         unexpectedMessage: 'Unexpected receipt print response from API',
@@ -475,6 +598,81 @@ class ApiService {
         .toList();
   }
 
+  String _frameCatalogDiskKey(String kioskCode, String eventCode) {
+    final raw = '$kioskCode|$eventCode';
+    final safe = raw.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
+    return 'frames_${safe.isEmpty ? 'default' : safe}';
+  }
+
+  Future<List<KioskFrameModel>> _readCachedFrames(String key) async {
+    final raw = await _catalogDiskCache.readJson(key);
+    if (raw is! List) return const [];
+    return raw
+        .whereType<Map>()
+        .map((row) => KioskFrameModel.fromJson(Map<String, dynamic>.from(row)))
+        .where((frame) => frame.id.isNotEmpty && frame.overlayUrl.isNotEmpty)
+        .toList(growable: false);
+  }
+
+  Future<void> _precacheFrameImages(Iterable<KioskFrameModel> frames) async {
+    final cache = _imageCacheService;
+    if (cache == null) return;
+    for (final frame in frames) {
+      await _cacheFrameOverlay(
+        cache,
+        frame.overlayUrl,
+        catalogCacheKeyForFrame(frame.id),
+      );
+      await _cacheFrameOverlay(
+        cache,
+        frame.strip.overlayUrl,
+        catalogCacheKeyForFrame('${frame.id}-strip'),
+      );
+      await _cacheFrameOverlay(
+        cache,
+        frame.strip.overlay3Url,
+        catalogCacheKeyForFrame('${frame.id}-strip3'),
+      );
+      await _cacheFrameOverlay(
+        cache,
+        frame.landscapeOverlayUrl,
+        catalogCacheKeyForFrame('${frame.id}-land'),
+      );
+    }
+  }
+
+  Future<void> _cacheFrameOverlay(
+    ImageCacheService cache,
+    String overlayUrl,
+    String? cacheKey,
+  ) async {
+    final url = overlayUrl.trim();
+    if (url.isEmpty) return;
+    await cache.cacheImage(
+      SecureImageUrl.absolutize(url),
+      cacheKey: cacheKey,
+    );
+  }
+
+  /// Disk-only occasion frames for Classic offline chrome (no network).
+  Future<List<KioskFrameModel>> getCachedKioskFrames() async {
+    try {
+      final kioskCode =
+          (await KioskManager().getKioskCode())?.trim().toUpperCase() ?? '';
+      final eventCode =
+          (await EventManager().getEventCode())?.trim().toUpperCase() ?? '';
+      final kioskId = SessionManager().currentSession?.kioskId ?? '';
+      return _readCachedFrames(
+        _frameCatalogDiskKey(
+          kioskCode.isEmpty ? kioskId : kioskCode,
+          eventCode,
+        ),
+      );
+    } catch (_) {
+      return const [];
+    }
+  }
+
   /// GET `/api/kiosk/frames` — active occasion frames for the current kiosk session.
   ///
   /// Backend requires at least one of `kioskCode` or `kioskId` (same as themes).
@@ -485,6 +683,11 @@ class ApiService {
       final eventCode =
           (await EventManager().getEventCode())?.trim().toUpperCase();
       final kioskId = SessionManager().currentSession?.kioskId;
+      final diskKey = _frameCatalogDiskKey(
+        kioskCode ?? kioskId ?? '',
+        eventCode ?? '',
+      );
+      final cachedFrames = await _readCachedFrames(diskKey);
 
       final qp = <String, dynamic>{};
       if (kioskCode != null && kioskCode.isNotEmpty) {
@@ -526,7 +729,7 @@ class ApiService {
             error: e,
             stackTrace: st,
           );
-          return <KioskFrameModel>[];
+          return cachedFrames;
         }
       }
 
@@ -542,11 +745,24 @@ class ApiService {
         throw ApiException('Failed to load frames ($status)', status);
       }
 
-      return _parseKioskFramesBody(data);
+      final frames = _parseKioskFramesBody(data);
+      await _catalogDiskCache.writeJson(
+        diskKey,
+        frames.map((frame) => frame.toJson()).toList(),
+      );
+      unawaited(_precacheFrameImages(frames));
+      return frames;
     } on ApiException {
       rethrow;
     } on DioException catch (e) {
       _handleWebNetworkError(e);
+      final kioskCode =
+          (await KioskManager().getKioskCode())?.trim().toUpperCase() ?? '';
+      final eventCode =
+          (await EventManager().getEventCode())?.trim().toUpperCase() ?? '';
+      final cached =
+          await _readCachedFrames(_frameCatalogDiskKey(kioskCode, eventCode));
+      if (cached.isNotEmpty) return cached;
       throw ApiException(
         'Failed to load frames: ${e.message}',
         e.response?.statusCode,
@@ -554,11 +770,47 @@ class ApiService {
     }
   }
 
+  Future<StripFiltersCatalog?> _readCachedStripFilters(String key) async {
+    final raw = await _catalogDiskCache.readJson(key);
+    if (raw is! Map) return null;
+    try {
+      return StripFiltersCatalog.fromJson(Map<String, dynamic>.from(raw));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _precacheStripCatalogOverlays(StripFiltersCatalog catalog) async {
+    final cache = _imageCacheService;
+    if (cache == null) return;
+    for (final frame in catalog.frames) {
+      final url = frame.overlayUrl?.trim() ?? '';
+      if (url.isNotEmpty) {
+        await cache.cacheImage(
+          SecureImageUrl.absolutize(url),
+          cacheKey: classicFrameOverlayCacheKey(frame.id),
+        );
+      }
+      final landscapeUrl = frame.landscapeOverlayUrl?.trim() ?? '';
+      if (landscapeUrl.isEmpty) continue;
+      await cache.cacheImage(
+        SecureImageUrl.absolutize(landscapeUrl),
+        cacheKey: classicFrameOverlayCacheKey(frame.id, landscape: true),
+      );
+    }
+  }
+
   /// GET `/api/strip/filters` — FotoFlashback look catalog + print hints.
   Future<StripFiltersCatalog> fetchStripFilters() async {
+    final kioskCode =
+        (await KioskManager().getKioskCode())?.trim().toUpperCase();
+    final diskKey = stripFiltersCatalogDiskKey(kioskCode);
+    final cached = await _readCachedStripFilters(diskKey);
+    if (SessionManager().isOfflineSession) {
+      if (cached != null) return cached;
+      throw ApiException('Strip filters unavailable offline');
+    }
     try {
-      final kioskCode =
-          (await KioskManager().getKioskCode())?.trim().toUpperCase();
       final qp = <String, dynamic>{};
       if (kioskCode != null && kioskCode.isNotEmpty) {
         qp['kiosk'] = kioskCode;
@@ -568,20 +820,35 @@ class ApiService {
         queryParameters: qp.isEmpty ? null : qp,
         options: Options(responseType: ResponseType.json),
       );
+      final status = r.statusCode;
+      if (status != null && status >= 400) {
+        if (cached != null) return cached;
+        throw ApiException(AppStrings.flashbackFiltersLoadFailed, status);
+      }
       final data = r.data;
+      Map<String, dynamic>? map;
       if (data is Map<String, dynamic>) {
-        return StripFiltersCatalog.fromJson(data);
+        map = data;
+      } else if (data is Map) {
+        map = Map<String, dynamic>.from(data);
       }
-      if (data is Map) {
-        return StripFiltersCatalog.fromJson(Map<String, dynamic>.from(data));
+      if (map == null) {
+        throw ApiException('Unexpected strip filters response');
       }
-      throw ApiException('Unexpected strip filters response');
+      final catalog = StripFiltersCatalog.fromJson(map);
+      await _catalogDiskCache.writeJson(diskKey, map);
+      unawaited(_precacheStripCatalogOverlays(catalog));
+      return catalog;
     } on ApiException {
       rethrow;
     } on DioException catch (e) {
       _handleWebNetworkError(e);
+      if (cached != null) return cached;
+      if (isDioTimeoutOrConnection(e)) {
+        throw ApiException(AppConstants.kErrorNetwork);
+      }
       throw ApiException(
-        'Failed to load strip filters: ${e.message}',
+        AppStrings.flashbackFiltersLoadFailed,
         e.response?.statusCode,
       );
     }
@@ -593,9 +860,9 @@ class ApiService {
     required List<String> images,
     String filter = kDefaultStripFilterId,
   }) async {
-    if (images.length != kStripShotCount) {
+    if (!kClassicStripShotCounts.contains(images.length)) {
       throw ApiException(
-        'FotoFlashback requires exactly $kStripShotCount photos.',
+        'FotoFlashback requires $kStripShotCountThree or $kStripShotCount photos.',
       );
     }
     try {
@@ -624,7 +891,7 @@ class ApiService {
         );
       }
       final raw = map['images'];
-      if (raw is! List || raw.length != kStripShotCount) {
+      if (raw is! List || raw.length != images.length) {
         throw ApiException('Strip preview grade returned invalid images');
       }
       final out = <String>[];
@@ -648,14 +915,15 @@ class ApiService {
   }
 
   /// POST `/api/sessions/:id/strip/clean-overlays` — remove viewfinder HUD.
-  /// Accepts 1 shot (per-accept scrub / Classic 6×4) or [kStripShotCount].
+  /// Accepts 1 shot (per-accept scrub / Classic 6×4) or a full strip (3 / 4).
   Future<StripOverlayCleanResult> cleanStripOverlays({
     required String sessionId,
     required List<String> images,
   }) async {
-    if (images.length != 1 && images.length != kStripShotCount) {
+    if (!isValidClassicComposeShotCount(images.length)) {
       throw ApiException(
-        'Classic overlay cleanup requires 1 or $kStripShotCount photos.',
+        'Classic overlay cleanup requires 1, $kStripShotCountThree '
+        'or $kStripShotCount photos.',
       );
     }
     try {
@@ -814,9 +1082,10 @@ class ApiService {
     PrintOrientation? orientation,
     Duration? timeout,
   }) async {
-    if (images.length != 1 && images.length != kStripShotCount) {
+    if (!isValidClassicComposeShotCount(images.length)) {
       throw ApiException(
-        'Classic compose requires 1 or $kStripShotCount photos.',
+        'Classic compose requires 1, $kStripShotCountThree '
+        'or $kStripShotCount photos.',
       );
     }
     try {
@@ -844,7 +1113,12 @@ class ApiService {
           responseType: ResponseType.json,
           sendTimeout: timeout ?? AppConstants.kClassicStripComposeTimeout,
           receiveTimeout: timeout ?? AppConstants.kClassicStripComposeTimeout,
+          validateStatus: (c) => c != null && c < 600,
         ),
+      );
+      throwIfHttpErrorResponse(
+        r,
+        operationLabel: AppStrings.flashbackComposeFailed,
       );
       final data = r.data;
       Map<String, dynamic>? map;
@@ -882,10 +1156,57 @@ class ApiService {
       rethrow;
     } on DioException catch (e) {
       _handleWebNetworkError(e);
+      if (isDioTimeoutOrConnection(e)) {
+        throw ApiException(
+          AppConstants.kErrorNetwork,
+          e.response?.statusCode,
+        );
+      }
       throw ApiException(
-        'Failed to compose strip: ${e.message}',
+        AppStrings.flashbackComposeFailed,
         e.response?.statusCode,
       );
+    }
+  }
+
+  /// POST `/api/sessions/:id/strip/deliverable` — store a locally baked print.
+  Future<String?> registerStripDeliverable({
+    required String sessionId,
+    required String imageDataUrl,
+  }) async {
+    final sid = sessionId.trim();
+    final dataUrl = imageDataUrl.trim();
+    if (sid.isEmpty || !dataUrl.startsWith(AppStrings.dataImagePrefix)) {
+      return null;
+    }
+    try {
+      final r = await _dio.post<dynamic>(
+        '/api/sessions/$sid/strip/deliverable',
+        data: <String, dynamic>{'imageDataUrl': dataUrl},
+        options: Options(
+          responseType: ResponseType.json,
+          validateStatus: (c) => c != null && c < 600,
+        ),
+      );
+      throwIfHttpErrorResponse(
+        r,
+        operationLabel: AppStrings.flashbackComposeFailed,
+      );
+      final data = r.data;
+      Map<String, dynamic>? map;
+      if (data is Map<String, dynamic>) {
+        map = data;
+      } else if (data is Map) {
+        map = Map<String, dynamic>.from(data);
+      }
+      if (map == null || map['success'] == false) return null;
+      final url = map['imageUrl']?.toString().trim() ?? '';
+      return url.isEmpty ? null : url;
+    } on ApiException {
+      return null;
+    } on DioException catch (e) {
+      _handleWebNetworkError(e);
+      return null;
     }
   }
 
@@ -971,6 +1292,7 @@ class ApiService {
     String? selectedFrameId,
     bool includeSelectedFrameId = false,
     bool groupConsentAccepted = true,
+    String? clientSessionId,
   }) async {
     try {
       final eventCode = await EventManager().getEventCode();
@@ -980,6 +1302,8 @@ class ApiService {
         if (source != null && source.isNotEmpty) 'source': source,
         'groupConsentAccepted': groupConsentAccepted,
         if (includeSelectedFrameId) 'selectedFrameId': selectedFrameId,
+        if (clientSessionId != null && clientSessionId.isNotEmpty)
+          'id': clientSessionId,
       });
       if (response is Map<String, dynamic>) return response;
       if (response is Map) return Map<String, dynamic>.from(response);
@@ -1009,8 +1333,10 @@ class ApiService {
     /// When true, sends `selectedFrameId` in the body (value may be JSON `null`).
     bool includeSelectedFrameId = false,
     String? selectedFrameId,
+
     /// Optional face count hint when sending `userImageUrl`.
     int? personCount,
+
     /// Optional framing metadata (recommended with photo upload).
     Map<String, dynamic>? framingMetadata,
   }) async {
@@ -1211,7 +1537,8 @@ class ApiService {
         data: <String, dynamic>{'code': c, 'subtotal': subtotal},
         options: Options(
           responseType: ResponseType.json,
-          validateStatus: (status) => status != null && status >= 200 && status < 500,
+          validateStatus: (status) =>
+              status != null && status >= 200 && status < 500,
         ),
       );
       throwIfHttpErrorResponse(r, operationLabel: 'Apply discount failed');
@@ -1241,7 +1568,8 @@ class ApiService {
         data: const <String, dynamic>{},
         options: Options(
           responseType: ResponseType.json,
-          validateStatus: (status) => status != null && status >= 200 && status < 500,
+          validateStatus: (status) =>
+              status != null && status >= 200 && status < 500,
         ),
       );
       throwIfHttpErrorResponse(r, operationLabel: 'Clear discount failed');
@@ -1270,7 +1598,8 @@ class ApiService {
         '/api/sessions/$sid/discount',
         options: Options(
           responseType: ResponseType.json,
-          validateStatus: (status) => status != null && status >= 200 && status < 500,
+          validateStatus: (status) =>
+              status != null && status >= 200 && status < 500,
         ),
       );
       throwIfHttpErrorResponse(r, operationLabel: 'Fetch discount failed');
@@ -1355,7 +1684,6 @@ class ApiService {
     required String themeId,
     void Function(String message)? onProgress,
   }) async {
-
     final apiClientWithTimeout =
         ApiClient(_aiDio, baseUrl: AppConstants.kBaseUrl);
 
@@ -1464,7 +1792,8 @@ class ApiService {
 
       final body = response.data;
       if (body is! ResponseBody) {
-        throw ApiException('Unexpected response for parallel generation stream');
+        throw ApiException(
+            'Unexpected response for parallel generation stream');
       }
 
       return consumeParallelGenerationSseStream(

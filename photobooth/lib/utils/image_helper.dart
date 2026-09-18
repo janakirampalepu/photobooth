@@ -12,7 +12,11 @@ import 'image_helper_channel_fix.dart';
 import 'image_helper_encode.dart';
 import 'session_user_image_validation.dart';
 import 'app_strings.dart';
+import 'encode_rgba_jpeg.dart';
+import 'jpeg_sof_peek.dart';
 import 'web_flow_trace.dart';
+
+export 'jpeg_sof_peek.dart' show peekJpegSofDimensions;
 
 /// Standard format/size for all captured photos (any camera, any platform).
 /// Ensures one common format and dimensions regardless of Flutter vs custom plugin.
@@ -33,46 +37,6 @@ const int kDnpPrintJpegQuality = kStripCapturedPhotoJpegQuality;
 /// `PATCH /api/sessions/:id` `userImageUrl`: long edge cap and quality (API contract).
 const int kSessionPatchUserImageMaxLongEdgePx = 1536;
 const int kSessionPatchUserImageJpegQuality = 85;
-
-/// Reads JPEG SOF width/height without decoding the bitmap.
-({int width, int height})? peekJpegSofDimensions(List<int> bytes) {
-  if (bytes.length < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8) {
-    return null;
-  }
-  var i = 2;
-  while (i + 1 < bytes.length) {
-    if (bytes[i] != 0xFF) {
-      i++;
-      continue;
-    }
-    final marker = bytes[i + 1];
-    if (marker == 0xD8 ||
-        marker == 0xD9 ||
-        marker == 0x01 ||
-        (marker >= 0xD0 && marker <= 0xD7)) {
-      i += 2;
-      continue;
-    }
-    if (i + 3 >= bytes.length) return null;
-    final len = (bytes[i + 2] << 8) | bytes[i + 3];
-    if (len < 2) return null;
-    final isSof = marker == 0xC0 ||
-        marker == 0xC1 ||
-        marker == 0xC2 ||
-        marker == 0xC3;
-    if (isSof) {
-      if (i + 8 >= bytes.length) return null;
-      final height = (bytes[i + 5] << 8) | bytes[i + 6];
-      final width = (bytes[i + 7] << 8) | bytes[i + 8];
-      if (width > 0 && height > 0) {
-        return (width: width, height: height);
-      }
-      return null;
-    }
-    i += 2 + len;
-  }
-  return null;
-}
 
 /// Average luma 0–255 from a tiny Skia decode. Used to detect underexposed
 /// Canon stills vs the gain-boosted live-view JPEG.
@@ -356,23 +320,18 @@ class ImageHelper {
 
   /// Decode with [ui.instantiateImageCodec] target size so 20MP Canon stills
   /// never allocate a full-resolution RGBA buffer on 4GB kiosks.
-  static Future<XFile> downscaleJpegToMaxLongEdge(
-    XFile sourceFile, {
+  static Future<Uint8List> downscaleJpegBytesToMaxLongEdge(
+    Uint8List bytes, {
     int maxLongEdge = kCapturedPhotoMaxDimension,
     int jpegQuality = 95,
   }) async {
-    if (kIsWeb) return sourceFile;
-    final path = sourceFile.path;
-    final bytes = path.isNotEmpty
-        ? await File(path).readAsBytes()
-        : await sourceFile.readAsBytes();
     if (bytes.isEmpty) {
       throw Exception('Captured image is empty');
     }
     final size = peekJpegSofDimensions(bytes);
     if (size == null ||
         (size.width <= maxLongEdge && size.height <= maxLongEdge)) {
-      return sourceFile;
+      return bytes;
     }
     final quality = jpegQuality.clamp(1, 100);
     final landscape = size.width >= size.height;
@@ -389,21 +348,69 @@ class ImageHelper {
         throw Exception('Skia downscale produced empty pixels');
       }
       final rgba = bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes);
-      final bakedBytes = await compute(
-        _encodeRgbaToJpegIsolate,
-        (
-          rgba: rgba,
-          width: image.width,
-          height: image.height,
-          jpegQuality: quality,
-          quarterTurns: 0,
-        ),
+      return encodeRgbaToJpeg(
+        rgba: rgba,
+        width: image.width,
+        height: image.height,
+        quality: quality,
       );
-      return _writeBakedJpegBytes(bakedBytes);
     } finally {
       image.dispose();
       codec.dispose();
     }
+  }
+
+  /// Skia-decode [bytes] into a PNG at [width]×[height] (occasion overlays).
+  ///
+  /// [ui.instantiateImageCodec] samples during decode so a print-resolution
+  /// overlay never becomes a full-size RGBA buffer on 4GB Android TV.
+  static Future<Uint8List> resizeImageBytesToPng({
+    required Uint8List bytes,
+    required int width,
+    required int height,
+  }) async {
+    if (bytes.isEmpty || width <= 0 || height <= 0) {
+      throw Exception('Overlay resize input is empty');
+    }
+    final codec = await ui.instantiateImageCodec(
+      bytes,
+      targetWidth: width,
+      targetHeight: height,
+    );
+    final frame = await codec.getNextFrame();
+    final image = frame.image;
+    try {
+      final bd = await image.toByteData(format: ui.ImageByteFormat.png);
+      if (bd == null) {
+        throw Exception('Skia overlay resize produced empty pixels');
+      }
+      return bd.buffer.asUint8List();
+    } finally {
+      image.dispose();
+      codec.dispose();
+    }
+  }
+
+  static Future<XFile> downscaleJpegToMaxLongEdge(
+    XFile sourceFile, {
+    int maxLongEdge = kCapturedPhotoMaxDimension,
+    int jpegQuality = 95,
+  }) async {
+    if (kIsWeb) return sourceFile;
+    final path = sourceFile.path;
+    final bytes = path.isNotEmpty
+        ? await File(path).readAsBytes()
+        : await sourceFile.readAsBytes();
+    if (bytes.isEmpty) {
+      throw Exception('Captured image is empty');
+    }
+    final sized = await downscaleJpegBytesToMaxLongEdge(
+      bytes,
+      maxLongEdge: maxLongEdge,
+      jpegQuality: jpegQuality,
+    );
+    if (identical(sized, bytes)) return sourceFile;
+    return _writeBakedJpegBytes(sized);
   }
 
   /// Skia decode → signed quarter-turns (negative = CCW / left) → JPEG.
@@ -851,21 +858,27 @@ class ImageHelper {
   static Future<String> encodeImageToBase64(XFile imageFile) async {
     try {
       final bytes = await imageFile.readAsBytes();
-      if (bytes.isEmpty) {
-        throw Exception(AppStrings.imageFileEmpty);
-      }
-
-      // Large Classic stills — keep base64 off the UI isolate.
-      final base64String = bytes.length > 256 * 1024
-          ? await compute(_base64EncodeIsolate, bytes)
-          : base64Encode(bytes);
       final extension = imageFile.path.toLowerCase().split('.').last;
       final mimeType = extension == 'png' ? 'image/png' : 'image/jpeg';
-
-      return 'data:$mimeType;base64,$base64String';
+      return encodeBytesToBase64DataUrl(bytes, mimeType: mimeType);
     } catch (e) {
       throw Exception('Failed to encode image to base64: $e');
     }
+  }
+
+  /// Encodes already-read JPEG/PNG bytes. Direct PTP uses this so the look
+  /// picker can paint [bytes] immediately without waiting on base64.
+  static Future<String> encodeBytesToBase64DataUrl(
+    Uint8List bytes, {
+    String mimeType = 'image/jpeg',
+  }) async {
+    if (bytes.isEmpty) {
+      throw Exception(AppStrings.imageFileEmpty);
+    }
+    final base64String = bytes.length > 256 * 1024
+        ? await compute(_base64EncodeIsolate, bytes)
+        : base64Encode(bytes);
+    return 'data:$mimeType;base64,$base64String';
   }
 
   /// Rotates an image 180 degrees and overwrites the original file.

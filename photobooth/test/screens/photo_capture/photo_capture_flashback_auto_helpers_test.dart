@@ -30,6 +30,27 @@ void main() {
       expect(AppConstants.kFlashbackCaptureCountdownSeconds, 10);
       expect(AppConstants.kFlashbackFollowOnCountdownSeconds, 10);
     });
+
+    test('Classic uses kiosk countdown when provided', () {
+      expect(
+        captureCountdownSecondsForMode(
+          isFlashbackMultiShot: true,
+          classicSeconds: 7,
+        ),
+        7,
+      );
+      expect(
+        captureCountdownSecondsForMode(
+          isFlashbackMultiShot: true,
+          classicSeconds: 3,
+        ),
+        5,
+      );
+      expect(
+        captureCountdownSecondsForMode(isFlashbackMultiShot: false),
+        AppConstants.kCaptureCountdownSeconds,
+      );
+    });
   });
 
   group('shouldPrepareSidecarStillDuringCountdown', () {
@@ -123,7 +144,7 @@ void main() {
     test('shows mid-strip while camera not ready', () {
       expect(
         shouldShowClassicBetweenShotReadyBanner(
-          isFourShot: true,
+          isStripSession: true,
           acceptedCount: 1,
           total: 4,
           hasCapturedPhoto: false,
@@ -139,7 +160,7 @@ void main() {
     test('hides during countdown, review, or when ready', () {
       expect(
         shouldShowClassicBetweenShotReadyBanner(
-          isFourShot: true,
+          isStripSession: true,
           acceptedCount: 1,
           total: 4,
           hasCapturedPhoto: false,
@@ -152,7 +173,7 @@ void main() {
       );
       expect(
         shouldShowClassicBetweenShotReadyBanner(
-          isFourShot: true,
+          isStripSession: true,
           acceptedCount: 1,
           total: 4,
           hasCapturedPhoto: false,
@@ -165,7 +186,7 @@ void main() {
       );
       expect(
         shouldShowClassicBetweenShotReadyBanner(
-          isFourShot: true,
+          isStripSession: true,
           acceptedCount: 0,
           total: 4,
           hasCapturedPhoto: false,

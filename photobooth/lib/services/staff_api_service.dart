@@ -11,7 +11,6 @@ import '../utils/app_strings.dart';
 import '../utils/constants.dart';
 import '../utils/exceptions.dart';
 import '../utils/logger.dart';
-import 'api_logging_interceptor.dart';
 import 'alice_inspector.dart';
 import 'dio_web_config_stub.dart' if (dart.library.html) 'dio_web_config.dart';
 import 'api_service_legacy_media.dart';
@@ -37,10 +36,7 @@ class StaffApiService {
 
     configureDioForWeb(_dio);
 
-    if (kDebugMode == true) {
-      _dio.interceptors.add(ApiLoggingInterceptor());
-      _dio.interceptors.add(AliceDioProxyInterceptor());
-    }
+    addHttpInspectorInterceptors(_dio);
 
     // Mirror the web-friendly error normalization in ApiService.
     _dio.interceptors.add(
@@ -271,6 +267,19 @@ class StaffApiService {
         'closingNotes': closingNotes,
       },
       defaultError: 'Failed to close register',
+    );
+  }
+
+  /// PATCH `/api/staff/me/offline-cash-pin` — syncs to kiosks via settings.
+  Future<void> updateOfflineCashPin(String pin) async {
+    final next = pin.trim();
+    if (next.isEmpty) {
+      throw ApiException('Offline cash PIN is required');
+    }
+    await _patchWithToken(
+      '/api/staff/me/offline-cash-pin',
+      data: {'offlineCashPin': next},
+      defaultError: 'Failed to update offline cash PIN',
     );
   }
 
@@ -559,15 +568,43 @@ class StaffApiService {
     required Map<String, dynamic> data,
     required String defaultError,
   }) async {
+    await _mutateWithToken(
+      path,
+      method: 'POST',
+      data: data,
+      defaultError: defaultError,
+    );
+  }
+
+  Future<void> _patchWithToken(
+    String path, {
+    required Map<String, dynamic> data,
+    required String defaultError,
+  }) async {
+    await _mutateWithToken(
+      path,
+      method: 'PATCH',
+      data: data,
+      defaultError: defaultError,
+    );
+  }
+
+  Future<void> _mutateWithToken(
+    String path, {
+    required String method,
+    required Map<String, dynamic> data,
+    required String defaultError,
+  }) async {
     final token = await _sessionManager.getToken();
     if (token == null || token.isEmpty) {
       throw ApiException('Staff session expired. Please log in again.');
     }
     try {
-      final r = await _dio.post<dynamic>(
+      final r = await _dio.request<dynamic>(
         path,
         data: data,
         options: Options(
+          method: method,
           headers: {AppStrings.staffTokenHeader: token},
           validateStatus: (c) => c != null && c >= 200 && c < 500,
           responseType: ResponseType.json,

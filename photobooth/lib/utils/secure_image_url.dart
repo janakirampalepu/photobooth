@@ -36,7 +36,7 @@ class SecureImageUrl {
   }
 
   static String _baseUrlNoTrailingSlash() {
-    const b = AppConfig.baseUrl;
+    final b = AppConfig.baseUrl;
     return b.endsWith('/') ? b.substring(0, b.length - 1) : b;
   }
 
@@ -62,6 +62,14 @@ class SecureImageUrl {
     final trimmed = url.trim();
     if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
       return rewriteKnownApiHost(trimmed);
+    }
+    // On-device Classic compose (web) returns a data JPEG — do not prefix
+    // AppConfig.baseUrl or Image.network will 404 a fake path.
+    if (trimmed.startsWith('data:') ||
+        trimmed.startsWith('blob:') ||
+        trimmed.startsWith('file:') ||
+        trimmed.startsWith('local-media:')) {
+      return trimmed;
     }
     final base = _baseUrlNoTrailingSlash();
     if (trimmed.startsWith('/')) return '$base$trimmed';

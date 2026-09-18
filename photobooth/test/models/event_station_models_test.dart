@@ -17,6 +17,23 @@ void main() {
     expect(jobs, hasLength(1));
     expect(jobs.first.id, 'j1');
     expect(jobs.first.previewUrls, ['https://cdn/a.jpg']);
+    expect(
+      EventThemeStationJob.fromJson({
+        'id': 'j-fail',
+        'sessionId': 's1',
+        'status': 'FAILED',
+        'rawStatus': 'FAILED',
+      }).canRetry,
+      isTrue,
+    );
+    expect(
+      EventThemeStationJob.fromJson({
+        'id': 'j-pend',
+        'sessionId': 's1',
+        'status': 'PENDING',
+      }).canSkip,
+      isTrue,
+    );
   });
 
   test('parses nested claimed theme job', () {
@@ -65,6 +82,9 @@ void main() {
         'printPending': 1,
         'printClaimed': 1,
         'printDone': 4,
+        'guestsRegistered': 9,
+        'processed': 7,
+        'digitalSent': 4,
       },
       'captures': [
         {
@@ -93,11 +113,28 @@ void main() {
       ],
     });
     expect(board.stats.captures, 3);
+    expect(board.delivery.guestsRegistered, 9);
+    expect(board.delivery.processed, 7);
+    expect(board.delivery.digitalSent, 4);
     expect(board.captures.single.sessionId, 's1');
     expect(board.themeJobs.single.status, 'DONE');
     expect(board.printJobs.first.status, 'CLAIMED');
     expect(board.printJobs.last.canReissue, isTrue);
     expect(captureCarouselUrls(board.captures), ['https://cdn/a.jpg']);
+    expect(
+      itemsForStationStatus(board.captures, 'ALL', (c) => c.status),
+      hasLength(1),
+    );
+    expect(board.themeJobs.single.times.isSkipped, isTrue);
+    expect(
+      EventCaptureStationItem.fromJson({
+        'sessionId': 's9',
+        'status': 'PENDING',
+        'previewUrls': ['https://cdn/z.jpg'],
+        'createdAt': '2026-09-07T10:00:00.000Z',
+      }).times.createdAt,
+      isNotNull,
+    );
     expect(
       stationStatusCount(board.printJobs, 'CLAIMED', (j) => j.status),
       1,
@@ -122,6 +159,17 @@ void main() {
     expect(stats.captures, 1);
     expect(stats.themeTotal, 6);
     expect(stats.printTotal, 9);
+  });
+
+  test('parses delivery stats from mixed types', () {
+    final delivery = EventDeliveryStats.fromJson({
+      'guestsRegistered': '3',
+      'processed': 1.0,
+      'digitalSent': true,
+    });
+    expect(delivery.guestsRegistered, 3);
+    expect(delivery.processed, 1);
+    expect(delivery.digitalSent, 0);
   });
 
   test('buckets unknown and failed print statuses', () {
@@ -178,6 +226,7 @@ void main() {
       ],
     }).withStationImageAuth(kioskCode: 'K1', eventCode: 'GALA');
     expect(board.captures.single.previewUrls.single, contains('sessionId=s1'));
+    expect(board.delivery.guestsRegistered, 0);
     expect(board.captures.single.previewUrls.single, contains('kioskCode=K1'));
     expect(board.themeJobs.single.previewUrls.single, contains('eventCode=GALA'));
     expect(board.printJobs.single.imageUrl, contains('sessionId=s1'));

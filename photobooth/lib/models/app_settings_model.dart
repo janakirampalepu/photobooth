@@ -1,4 +1,5 @@
 import '../utils/json_parse_helpers.dart';
+import 'receipt_merchant_cache.dart';
 
 class AppSettingsModel {
   final String? id;
@@ -17,6 +18,10 @@ class AppSettingsModel {
   final int? compressionMaxDimension;
   /// When true (from `/api/settings`), show generation commentary; also RAM monitor on capture.
   final bool? showGenerationCommentary;
+
+  /// When true, show the Alice HTTP inspector icon. Defaults to **true** when
+  /// `/api/settings` omits `show_api_logs` / `showApiLogs`.
+  final bool showApiLogs;
 
   /// When true, enables UVC thermal relief (idle feed sleep, lifecycle pause) on capture.
   final bool? thermalSafeMode;
@@ -65,10 +70,23 @@ class AppSettingsModel {
   /// for the bound kiosk when settings were fetched with `?kiosk=` (kiosk
   /// override wins over account default). True = AF/OSD scrub; false/null = originals.
   final bool? enableOsdScrub;
+  /// Per-kiosk Classic pose countdown in seconds (5–15). Null = use default 10.
+  final int? classicPoseCountdownSeconds;
+  /// When true, offline cash checkout records the session paid and prints
+  /// without a staff booth PIN (`/api/settings` → `skipOfflineCashPin`).
+  final bool? skipOfflineCashPin;
+  /// When true, cash checkout records CASH and prints without waiting for
+  /// staff approval (`/api/settings` → `autoApproveCashPrint`).
+  final bool? autoApproveCashPrint;
   /// Test-only: burn AF brackets into Classic captures (`injectAfMarkers`).
   final bool? injectAfMarkers;
   /// Classic Surprise Me AI teaser (`settings.photoStripConfig.enableSurpriseMeAi`).
   final bool? enableSurpriseMeAi;
+  /// Offline cash booth PINs from staff members (`/api/settings` → `offlineCashPins`).
+  /// Cached on disk with the rest of settings; master PIN `2468` always works.
+  final List<String>? offlineCashPins;
+  /// GST / merchant header for offline tax invoices (`receiptMerchant`).
+  final ReceiptMerchantCache? receiptMerchant;
   final DateTime? createdAt;
   final DateTime? updatedAt;
 
@@ -88,6 +106,7 @@ class AppSettingsModel {
     this.compressionQuality,
     this.compressionMaxDimension,
     this.showGenerationCommentary,
+    this.showApiLogs = true,
     this.thermalSafeMode,
     this.defaultAiProvider,
     this.fallbackAiProvider,
@@ -123,8 +142,13 @@ class AppSettingsModel {
     this.exifStampEnabled,
     this.c2paSigningEnabled,
     this.enableOsdScrub,
+    this.classicPoseCountdownSeconds,
+    this.skipOfflineCashPin,
+    this.autoApproveCashPrint,
     this.injectAfMarkers,
     this.enableSurpriseMeAi,
+    this.offlineCashPins,
+    this.receiptMerchant,
     this.createdAt,
     this.updatedAt,
   });
@@ -157,6 +181,7 @@ class AppSettingsModel {
           JsonParseHelpers.intOrNull(json['compressionMaxDimension']),
       showGenerationCommentary:
           JsonParseHelpers.boolOrNull(json['showGenerationCommentary']),
+      showApiLogs: _parseShowApiLogs(json),
       thermalSafeMode: JsonParseHelpers.boolOrNull(json['thermalSafeMode']),
       defaultAiProvider: JsonParseHelpers.stringOrNull(json['defaultAiProvider']),
       fallbackAiProvider:
@@ -206,6 +231,16 @@ class AppSettingsModel {
             stripMap?['enableOsdScrub'],
           ) ??
           JsonParseHelpers.boolOrNull(json['enableOsdScrub']),
+      classicPoseCountdownSeconds: JsonParseHelpers.intOrNull(
+        json['classicPoseCountdownSeconds'] ??
+            json['classic_pose_countdown_seconds'],
+      ),
+      skipOfflineCashPin: JsonParseHelpers.boolOrNull(
+            json['skipOfflineCashPin'] ?? json['skip_offline_cash_pin'],
+          ),
+      autoApproveCashPrint: JsonParseHelpers.boolOrNull(
+            json['autoApproveCashPrint'] ?? json['auto_approve_cash_print'],
+          ),
       injectAfMarkers: JsonParseHelpers.boolOrNull(
             stripMap?['injectAfMarkers'],
           ) ??
@@ -214,8 +249,27 @@ class AppSettingsModel {
             stripMap?['enableSurpriseMeAi'],
           ) ??
           JsonParseHelpers.boolOrNull(json['enableSurpriseMeAi']),
+      offlineCashPins: _parseOfflineCashPins(json['offlineCashPins']),
+      receiptMerchant: ReceiptMerchantCache.tryParse(json['receiptMerchant']),
       createdAt: JsonParseHelpers.dateTimeOrNull(json['createdAt']),
       updatedAt: JsonParseHelpers.dateTimeOrNull(json['updatedAt']),
     );
+  }
+
+  /// `show_api_logs` (device setting) or camelCase; missing / non-bool → true.
+  static bool _parseShowApiLogs(Map<String, dynamic> json) {
+    return JsonParseHelpers.boolOrNull(json['show_api_logs']) ??
+        JsonParseHelpers.boolOrNull(json['showApiLogs']) ??
+        true;
+  }
+
+  static List<String>? _parseOfflineCashPins(Object? raw) {
+    if (raw is! List) return null;
+    final pins = <String>[];
+    for (final item in raw) {
+      final p = item?.toString().trim() ?? '';
+      if (RegExp(r'^\d{4,8}$').hasMatch(p)) pins.add(p);
+    }
+    return pins;
   }
 }

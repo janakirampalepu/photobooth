@@ -1,4 +1,4 @@
-import 'dart:async' show Timer, unawaited;
+import 'dart:async' show Timer;
 import 'dart:math';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
@@ -9,6 +9,7 @@ import 'theme_slideshow_viewmodel.dart';
 import '../terms_and_conditions/terms_and_conditions_view.dart';
 import '../../utils/constants.dart';
 import 'theme_slideshow_image.dart';
+import '../../services/image_cache_source.dart';
 import '../../views/widgets/bottom_safe_area.dart';
 
 /// Enum for different slide transition types
@@ -79,7 +80,9 @@ class _ThemeSlideshowScreenState extends State<ThemeSlideshowScreen> {
         _viewModel.preloadImages(currentContext);
       }
     }
-    unawaited(_viewModel.fetchThemes());
+    // Bundled slideshow assets only. GET /api/themes without a kiosk is thrown
+    // away when splash binds; Experience Choice / theme selection fetch with
+    // kiosk scope.
   }
 
   void _onViewModelChanged() {
@@ -376,6 +379,7 @@ class _ThemeSlideshowScreenState extends State<ThemeSlideshowScreen> {
     ThemeSlideshowViewModel viewModel,
     List<String> displayUrls,
   ) {
+    final slideUrl = displayUrls[_currentIndex % displayUrls.length];
     return Positioned.fill(
       child: AnimatedSwitcher(
         duration: viewModel.areAllImagesLoaded
@@ -393,7 +397,10 @@ class _ThemeSlideshowScreenState extends State<ThemeSlideshowScreen> {
           height: double.infinity,
           decoration: const BoxDecoration(color: Colors.black),
           child: ThemeSlideshowImage(
-            path: displayUrls[_currentIndex % displayUrls.length],
+            path: slideUrl,
+            cacheKey: catalogCacheKeyForTheme(
+              viewModel.getThemeForImageUrl(slideUrl)?.id,
+            ),
             fit: BoxFit.cover,
             width: double.infinity,
             height: double.infinity,

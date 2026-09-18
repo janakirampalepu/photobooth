@@ -27,6 +27,16 @@ class ResultPaymentQrArea extends StatelessWidget {
   }
 
   Widget _buildContent(ResultViewModel vm) {
+    if (vm.collectsCounterCash) {
+      return Padding(
+        padding: const EdgeInsets.all(12),
+        child: Icon(
+          Icons.payments_outlined,
+          size: 48,
+          color: Colors.grey.shade600,
+        ),
+      );
+    }
     if (!vm.isPaymentGatewayEnabled) {
       return Padding(
         padding: const EdgeInsets.all(8),

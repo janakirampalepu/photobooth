@@ -8,6 +8,7 @@ import 'package:provider/provider.dart';
 import 'result_payment_card_widgets.dart';
 import 'result_payment_qr_area.dart';
 import 'result_payment_status.dart';
+import 'result_offline_cash_sheet.dart';
 import 'result_viewmodel.dart';
 import '../../services/app_settings_manager.dart';
 import '../../utils/constants.dart';
@@ -16,11 +17,10 @@ import '../../utils/logger.dart';
 import '../../views/widgets/app_colors.dart';
 import '../../views/widgets/app_snackbar.dart';
 import '../../views/widgets/centered_max_width.dart';
-import '../../views/widgets/leading_with_alice.dart';
 import '../../views/widgets/theme_background.dart';
 import '../../views/widgets/delete_my_photos_action.dart';
 import '../../services/payment_push_coordinator.dart';
-import '../../services/kiosk_manager.dart';
+import '../../utils/payment_workflow_helpers.dart';
 import '../../utils/route_args.dart';
 import '../transformation_details/transformation_details_view.dart';
 import '../../services/session_manager.dart';
@@ -41,7 +41,6 @@ class _ResultScreenState extends State<ResultScreen> {
   bool _paymentConfirmedSnackShown = false;
   String? _customerPhone;
   String? _transformationRunId;
-  bool? _paymentsEnabledOverride;
   Timer? _failureIdleTimer;
   Timer? _paymentSuccessNavFallback;
   int _failureSecondsLeft = 0;
@@ -52,6 +51,7 @@ class _ResultScreenState extends State<ResultScreen> {
   /// Prevents double-taps on slow connections and lets us swap the button
   /// label for an inline spinner.
   bool _refreshingPolling = false;
+  bool _offlineCashAutoSettled = false;
 
   /// Guards [WidgetsBinding.addPostFrameCallback] so we do not queue duplicate
   /// thank-you navigations on every [Consumer] rebuild (same as pre-refactor intent).
@@ -86,6 +86,7 @@ class _ResultScreenState extends State<ResultScreen> {
       originalPhoto: originalPhoto,
       printOrientation: parsed.printOrientation,
       printSize: parsed.printSize,
+      classicComposeShotCount: parsed.classicComposeShotCount,
       appSettingsManager: context.read<AppSettingsManager>(),
       contact: parsed.contact,
     );
@@ -95,14 +96,19 @@ class _ResultScreenState extends State<ResultScreen> {
   }
 
   Future<void> _initPaymentMode() async {
-    final v = await KioskManager().getPaymentEnabledOverride();
+    final paymentsEnabled = await resolvePaymentsEnabled();
     if (!mounted) return;
-    setState(() => _paymentsEnabledOverride = v);
-    final paymentsEnabled = _paymentsEnabledOverride ?? true;
+    _viewModel?.setCollectsCounterCash(
+      shouldCollectCounterCash(paymentsEnabled: paymentsEnabled),
+    );
+    if (!mounted) return;
+    setState(() {});
     if (!paymentsEnabled) {
-      PaymentPushCoordinator.instance.registerResultScreenCallback(null);
+      PaymentPushCoordinator.instance
+          .registerResultScreenCallback(_onPaymentPushFromFcm);
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        unawaited(_triggerFreeModePrint());
+        unawaited(PaymentPushCoordinator.instance.flushPendingStoragePayment());
+        _viewModel?.loadPaymentQr(customerPhone: _customerPhone);
       });
       return;
     }
@@ -120,6 +126,7 @@ class _ResultScreenState extends State<ResultScreen> {
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       unawaited(PaymentPushCoordinator.instance.flushPendingStoragePayment());
+      unawaited(_maybeAutoSettleOfflineCash());
       _viewModel?.loadPaymentQr(customerPhone: _customerPhone);
     });
   }
@@ -150,6 +157,46 @@ class _ResultScreenState extends State<ResultScreen> {
     if (success == false) {
       _lastPaymentSuccessForNav = false;
     }
+  }
+
+  bool _skipCashStaffApproval() {
+    final s = context.read<AppSettingsManager>().settings;
+    return skipCashStaffApproval(
+      skipOfflineCashPin: s?.skipOfflineCashPin == true,
+      autoApproveCashPrint: s?.autoApproveCashPrint == true,
+    );
+  }
+
+  Future<void> _maybeAutoSettleOfflineCash() async {
+    if (_offlineCashAutoSettled || kIsWeb) return;
+    final vm = _viewModel;
+    if (vm == null || !vm.cashOnlyOffline) return;
+    if (!_skipCashStaffApproval()) return;
+    await _settleOfflineCashWithoutPin(vm);
+  }
+
+  Future<void> _onStaffCashConfirm(ResultViewModel viewModel) async {
+    if (_skipCashStaffApproval()) {
+      await _settleOfflineCashWithoutPin(viewModel);
+      return;
+    }
+    if (!mounted) return;
+    await showOfflineCashConfirmSheet(
+      context: context,
+      viewModel: viewModel,
+    );
+  }
+
+  Future<void> _settleOfflineCashWithoutPin(ResultViewModel viewModel) async {
+    if (_offlineCashAutoSettled) return;
+    _offlineCashAutoSettled = true;
+    final ok = await viewModel.confirmOfflineCashReceived(skipPin: true);
+    if (!mounted) return;
+    if (!ok) {
+      _offlineCashAutoSettled = false;
+      return;
+    }
+    await viewModel.publishOfflineCashApproval();
   }
 
   void _onPaymentSucceeded(ResultViewModel viewModel) {
@@ -308,7 +355,7 @@ class _ResultScreenState extends State<ResultScreen> {
       viewModel.enterGuestQrShareMode();
 
       // Keep the session alive for a short window so operators can print/share.
-      // QrShareScreen will wipe locally and reset back to Terms after 60s.
+      // QrShareScreen wipes locally and resets to Terms (60s online / 12s offline).
       await Navigator.of(context).pushReplacementNamed(
         AppConstants.kRouteQrShare,
         arguments: QrShareArgs(
@@ -398,7 +445,6 @@ class _ResultScreenState extends State<ResultScreen> {
     BuildContext context,
     ResultViewModel viewModel,
     AppColors appColors,
-    bool paymentsEnabled,
   ) {
     return Scaffold(
       backgroundColor: Colors.transparent,
@@ -418,15 +464,18 @@ class _ResultScreenState extends State<ResultScreen> {
             fontSize: 22,
           ),
         ),
-        bottom: const PreferredSize(
-          preferredSize: Size.fromHeight(22),
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(22),
           child: Padding(
-            padding: EdgeInsets.only(bottom: 6),
+            padding: const EdgeInsets.only(bottom: 6),
             child: Text(
-              'Scan to complete your purchase',
+              payScreenAppBarSubtitle(
+                collectsCounterCash: viewModel.collectsCounterCash,
+                sessionOffline: viewModel.cashOnlyOffline,
+              ),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: TextStyle(
+              style: const TextStyle(
                 color: Colors.white70,
                 fontSize: 13,
                 fontWeight: FontWeight.w500,
@@ -439,7 +488,6 @@ class _ResultScreenState extends State<ResultScreen> {
           icon: const Icon(CupertinoIcons.back, color: Colors.white),
           onPressed: _confirmAndPopBack,
         ),
-        actions: const [AppBarAliceAction()],
       ),
       body: Stack(
         children: [
@@ -464,22 +512,19 @@ class _ResultScreenState extends State<ResultScreen> {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
-                            _buildTitleSection(appColors),
+                            _buildTitleSection(appColors, viewModel),
                             if (_transformationRunId != null) ...[
                               const SizedBox(height: 4),
                               _buildTransformationDetailsLink(),
                             ],
                             const SizedBox(height: 8),
-                            if (paymentsEnabled)
-                              Expanded(
-                                child: _buildPaymentCard(
-                                  context,
-                                  viewModel,
-                                  appColors,
-                                ),
-                              )
-                            else
-                              const Spacer(),
+                            Expanded(
+                              child: _buildPaymentCard(
+                                context,
+                                viewModel,
+                                appColors,
+                              ),
+                            ),
                             if (viewModel.hasError)
                               _buildErrorBanner(viewModel),
                             if (viewModel.fcmPaymentPushSuccess == true &&
@@ -597,7 +642,6 @@ class _ResultScreenState extends State<ResultScreen> {
   @override
   Widget build(BuildContext context) {
     final appColors = AppColors.of(context);
-    final paymentsEnabled = _paymentsEnabledOverride ?? true;
 
     if (!_isInitialized || _viewModel == null) {
       return Scaffold(
@@ -615,18 +659,21 @@ class _ResultScreenState extends State<ResultScreen> {
             context,
             viewModel,
             appColors,
-            paymentsEnabled,
           );
         },
       ),
     );
   }
 
-  Widget _buildTitleSection(AppColors appColors) {
+  Widget _buildTitleSection(AppColors appColors, ResultViewModel viewModel) {
+    final intro = payScreenIntroMessage(
+      collectsCounterCash: viewModel.collectsCounterCash,
+    );
+    if (intro == null) return const SizedBox.shrink();
     return Padding(
       padding: const EdgeInsets.only(top: 0, bottom: 2),
       child: Text(
-        'Scan the QR code to pay with UPI.\nPrinting starts automatically after payment is approved.',
+        intro,
         maxLines: 3,
         overflow: TextOverflow.ellipsis,
         style: TextStyle(
@@ -813,6 +860,9 @@ class _ResultScreenState extends State<ResultScreen> {
                 onGetHelp: () => _showGetHelpDialog(viewModel),
                 refreshPollingChild: _buildRefreshPollingChild(),
                 buildQrArea: _buildPaymentQrArea,
+                onStaffCashConfirm: viewModel.cashOnlyOffline && !kIsWeb
+                    ? () => unawaited(_onStaffCashConfirm(viewModel))
+                    : null,
               );
             },
           ),

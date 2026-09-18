@@ -1,9 +1,16 @@
 import 'dart:async' show unawaited;
 
-import 'package:flutter/foundation.dart' show defaultTargetPlatform, TargetPlatform;
+import 'package:flutter/foundation.dart'
+    show defaultTargetPlatform, TargetPlatform;
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart'
-    show Colors, Divider, Orientation, Scaffold, CircularProgressIndicator, RouteSettings;
+    show
+        Colors,
+        Divider,
+        Orientation,
+        Scaffold,
+        CircularProgressIndicator,
+        RouteSettings;
 import 'package:provider/provider.dart';
 import 'terms_and_conditions_viewmodel.dart';
 import 'terms_camera_priming.dart';
@@ -22,8 +29,10 @@ import '../photo_capture/photo_capture_uvc_device_helpers.dart';
 import '../photo_capture/photo_capture_viewmodel.dart';
 import '../splash/bootstrap_route_args.dart';
 import '../webview/webview_screen.dart';
+import '../../models/app_settings_model.dart';
 import '../../services/app_settings_manager.dart';
 import '../../services/api_service.dart';
+import '../../services/event_manager.dart';
 import '../../services/kiosk_manager.dart';
 import '../../services/local_camera_service.dart';
 import '../../services/fcm_service.dart';
@@ -58,7 +67,11 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
   bool _navigatingToCapture = false;
   bool _startingExperience = false;
   Object? _capturePrefillPhoto;
-  TermsCameraPrimingPhase _cameraPrimingPhase = TermsCameraPrimingPhase.detecting;
+  TermsCameraPrimingPhase _cameraPrimingPhase =
+      TermsCameraPrimingPhase.detecting;
+
+  /// Drives the Canon-specific wording on the detecting banner.
+  bool _canonUsbPermissionPending = false;
 
   bool _canStartExperience(bool photoUploadAllowed) =>
       !_navigatingToCapture &&
@@ -93,6 +106,11 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
 
     if (mounted && defaultTargetPlatform == TargetPlatform.android) {
       final settings = context.read<AppSettingsManager>().settings;
+      if (await _resumePrimedCanonBooth(settings)) {
+        await FcmService.ensurePermissionAndPersistToken();
+        return;
+      }
+      await _refreshCanonUsbPermissionPending(settings);
       // Stop EDSDK sidecar before PTP touches USB (async settings sync used to race POSE).
       await syncCanonCameraStackForSettings(settings);
       if (usesDirectPtpCamera(settings: settings)) {
@@ -106,12 +124,40 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
     await _primeCaptureScreenOnLaunch();
   }
 
+  /// Fast path for guests 2..N: the USB grant and PTP session outlive Terms.
+  ///
+  /// A full pass would replay the 20 s warm-up loop — and hold the banner and
+  /// the disabled Continue button up for its duration — for a camera that never
+  /// left. The live probe still runs, so an unplugged body falls through.
+  Future<bool> _resumePrimedCanonBooth(AppSettingsModel? settings) async {
+    if (!isOnDeviceCanonUsbBooth(settings)) return false;
+    final stillReady = await canSkipTermsPrimingOnReentry(
+      primedBefore: TermsCanonPrimingMemo.isPrimed,
+      probeStillReady: () => isOnDeviceCanonBoothStillReady(settings: settings),
+    );
+    if (!stillReady || !mounted) return stillReady;
+    setState(() {
+      _canonUsbPermissionPending = false;
+      _cameraPrimingPhase = TermsCameraPrimingPhase.ready;
+    });
+    return true;
+  }
+
+  /// Decides the detecting-banner wording before the allow dialog can appear.
+  Future<void> _refreshCanonUsbPermissionPending(
+    AppSettingsModel? settings,
+  ) async {
+    if (!isOnDeviceCanonUsbBooth(settings)) return;
+    final held = await isOnDeviceCanonUsbPermissionHeld(settings: settings);
+    if (!mounted) return;
+    setState(() => _canonUsbPermissionPending = !held);
+  }
+
   /// Permission, enumeration, and live-camera prewarm while the guest reads terms.
   Future<void> _primeCaptureScreenOnLaunch() async {
     if (!supportsTermsCameraPriming) return;
 
-    if (mounted &&
-        _cameraPrimingPhase != TermsCameraPrimingPhase.detecting) {
+    if (mounted && _cameraPrimingPhase != TermsCameraPrimingPhase.detecting) {
       setState(() => _cameraPrimingPhase = TermsCameraPrimingPhase.detecting);
     }
 
@@ -152,8 +198,16 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
       ensureCanonUsbPermission: _ensureCanonUsbPermissionForTerms,
     );
 
+    if (result.phase == TermsCameraPrimingPhase.ready) {
+      TermsCanonPrimingMemo.markPrimed();
+    }
     if (!mounted) return;
-    setState(() => _cameraPrimingPhase = result.phase);
+    setState(() {
+      if (result.phase == TermsCameraPrimingPhase.ready) {
+        _canonUsbPermissionPending = false;
+      }
+      _cameraPrimingPhase = result.phase;
+    });
   }
 
   Future<bool> _ensureCanonUsbPermissionForTerms() async {
@@ -183,9 +237,9 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
     }
     try {
       final ok = await service.isHealthy().timeout(
-        const Duration(seconds: 3),
-        onTimeout: () => false,
-      );
+            const Duration(seconds: 3),
+            onTimeout: () => false,
+          );
       service.dispose();
       return ok;
     } on Object {
@@ -196,7 +250,15 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
 
   Future<void> _retryCameraPriming() async {
     if (!supportsTermsCameraPriming) return;
+    // A guest who had to tap Retry must not inherit an earlier guest's memo:
+    // the next Terms entry has to re-prime from scratch.
+    TermsCanonPrimingMemo.reset();
     setState(() => _cameraPrimingPhase = TermsCameraPrimingPhase.detecting);
+    if (mounted && defaultTargetPlatform == TargetPlatform.android) {
+      await _refreshCanonUsbPermissionPending(
+        context.read<AppSettingsManager>().settings,
+      );
+    }
     await _primeCaptureScreenOnLaunch();
   }
 
@@ -245,7 +307,12 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
     if (success && mounted) {
       // Keep camera prewarm alive for the AI capture path.
       _navigatingToCapture = true;
-      if (runtime.classicPhotosEnabled) {
+      final frameOnlyEvent =
+          await EventManager().getPhotoModeOverride() == 'FRAME_ONLY';
+      if (!mounted) return;
+      if (runtime.classicPhotosEnabled ||
+          frameOnlyEvent ||
+          !runtime.aiPhotosEnabled) {
         await pushReplacementKioskFade<void, void>(
           context,
           ExperienceChoiceScreen(capturePrefillPhoto: _capturePrefillPhoto),
@@ -264,7 +331,8 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
           ),
           settings: RouteSettings(
             name: '${AppConstants.kRouteCapture}-ai',
-            arguments: prefill == null ? null : <String, Object?>{'photo': prefill},
+            arguments:
+                prefill == null ? null : <String, Object?>{'photo': prefill},
           ),
         );
       }
@@ -307,7 +375,7 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
     final mediaQuery = MediaQuery.of(context);
     final screenWidth = mediaQuery.size.width;
     final isLandscape = mediaQuery.orientation == Orientation.landscape;
-    
+
     final layout = TermsLayoutMetrics(
       screenWidth: screenWidth,
       isLandscape: isLandscape,
@@ -342,7 +410,8 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
                         child: Consumer<TermsAndConditionsViewModel>(
                           builder: (context, viewModel, child) {
                             // Gate the whole flow until the kiosk is provisioned.
-                            final kioskCode = (viewModel.kioskCode ?? '').trim();
+                            final kioskCode =
+                                (viewModel.kioskCode ?? '').trim();
                             if (!viewModel.kioskCodeLoaded) {
                               return ConstrainedBox(
                                 constraints:
@@ -367,7 +436,8 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
                               );
                             }
                             return ConstrainedBox(
-                              constraints: BoxConstraints(maxWidth: cardMaxWidth),
+                              constraints:
+                                  BoxConstraints(maxWidth: cardMaxWidth),
                               child: _buildConsentCard(
                                 viewModel,
                                 appColors,
@@ -382,7 +452,7 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
                   ),
                 ],
               ),
-              
+
               // Session API overlay only — camera is prepared on Terms before Continue.
               Consumer<TermsAndConditionsViewModel>(
                 builder: (context, viewModel, child) {
@@ -476,7 +546,7 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
               ],
             ),
           ),
-          
+
           // Divider
           Divider(height: 1, color: appColors.dividerColor),
 
@@ -497,18 +567,19 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
               ],
             ),
           ),
-          
+
           // Checkbox section
           Container(
             margin: EdgeInsets.symmetric(horizontal: cardPadding),
-            padding: EdgeInsets.all(layout.checkboxAreaPadding(compact: compact)),
+            padding:
+                EdgeInsets.all(layout.checkboxAreaPadding(compact: compact)),
             decoration: BoxDecoration(
               color: appColors.backgroundColor,
               borderRadius: BorderRadius.circular(12),
             ),
             child: _buildCheckbox(viewModel, appColors),
           ),
-          
+
           SizedBox(height: layout.sectionGap(compact: compact)),
 
           if (viewModel.hasError) ...[
@@ -526,7 +597,7 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
             ),
             SizedBox(height: layout.innerSectionGap(compact: compact)),
           ],
-          
+
           // Action button
           Padding(
             padding: EdgeInsets.symmetric(horizontal: cardPadding),
@@ -536,9 +607,9 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
               photoUploadAllowed: photoUploadAllowed,
             ),
           ),
-          
+
           SizedBox(height: layout.innerSectionGap(compact: compact)),
-          
+
           // View full T&C link
           Center(
             child: CupertinoButton(
@@ -554,7 +625,7 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
               ),
             ),
           ),
-          
+
           const SizedBox(height: 16),
         ],
       ),
@@ -568,6 +639,7 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
     required bool photoUploadAllowed,
   }) {
     final uploadOk = photoUploadAllowed;
+    final settings = context.read<AppSettingsManager>().settings;
     switch (_cameraPrimingPhase) {
       case TermsCameraPrimingPhase.skipped:
       case TermsCameraPrimingPhase.ready:
@@ -580,6 +652,10 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
           message: termsCameraPrimingBannerMessage(
             phase: _cameraPrimingPhase,
             photoUploadAllowed: uploadOk,
+            showCanonUsbHint: shouldShowCanonUsbPrimingHint(
+              isCanonUsbBooth: isOnDeviceCanonUsbBooth(settings),
+              permissionPending: _canonUsbPermissionPending,
+            ),
           ),
           showSpinner: true,
         );
@@ -674,9 +750,15 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
           ),
         ),
         const SizedBox(height: 16),
-        _buildBulletPoint('AI processing of your photo to create transformed images', appColors),
-        _buildBulletPoint('Automatic deletion of your data 15 minutes after printing', appColors),
-        _buildBulletPoint('All people in the photo have given permission to be photographed', appColors),
+        _buildBulletPoint(
+            'AI processing of your photo to create transformed images',
+            appColors),
+        _buildBulletPoint(
+            'Automatic deletion of your data 15 minutes after printing',
+            appColors),
+        _buildBulletPoint(
+            'All people in the photo have given permission to be photographed',
+            appColors),
         const SizedBox(height: 20),
         Text(
           'Your photos are never sold or shared.',
@@ -735,7 +817,8 @@ class _TermsAndConditionsScreenState extends State<TermsAndConditionsScreen> {
     return CupertinoColors.black;
   }
 
-  Widget _buildCheckbox(TermsAndConditionsViewModel viewModel, AppColors appColors) {
+  Widget _buildCheckbox(
+      TermsAndConditionsViewModel viewModel, AppColors appColors) {
     final agreed = viewModel.isAgreed;
     return GestureDetector(
       onTap: () => viewModel.toggleAgreement(!agreed),

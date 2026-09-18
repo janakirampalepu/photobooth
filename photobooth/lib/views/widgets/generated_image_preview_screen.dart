@@ -3,6 +3,37 @@ import 'package:flutter/material.dart';
 
 import 'cached_network_image.dart';
 
+/// Opens [GeneratedImagePreviewScreen] as a fade-in overlay.
+Future<void> showGeneratedImagePreview(
+  BuildContext context, {
+  required String imageUrl,
+  String? title,
+  String? subtitle,
+}) {
+  final url = imageUrl.trim();
+  if (url.isEmpty) return Future<void>.value();
+  return Navigator.of(context).push<void>(
+    PageRouteBuilder<void>(
+      opaque: false,
+      barrierColor: Colors.black.withValues(alpha: 0.92),
+      pageBuilder: (_, __, ___) => GeneratedImagePreviewScreen(
+        imageUrl: url,
+        title: title,
+        subtitle: subtitle,
+      ),
+      transitionsBuilder: (_, animation, __, child) {
+        return FadeTransition(
+          opacity: CurvedAnimation(
+            parent: animation,
+            curve: Curves.easeOutCubic,
+          ),
+          child: child,
+        );
+      },
+    ),
+  );
+}
+
 /// Full-screen preview for a generated portrait (pinch / pan via [InteractiveViewer]).
 class GeneratedImagePreviewScreen extends StatelessWidget {
   const GeneratedImagePreviewScreen({
@@ -29,38 +60,39 @@ class GeneratedImagePreviewScreen extends StatelessWidget {
           children: [
             Positioned.fill(
               child: LayoutBuilder(
-              builder: (context, constraints) {
-                return InteractiveViewer(
-                  minScale: 0.85,
-                  maxScale: 4,
-                  child: SizedBox(
-                    width: constraints.maxWidth,
-                    height: constraints.maxHeight,
-                    child: FittedBox(
-                      fit: BoxFit.contain,
-                      child: CachedNetworkImage(
-                        imageUrl: imageUrl,
+                builder: (context, constraints) {
+                  return InteractiveViewer(
+                    minScale: 0.85,
+                    maxScale: 4,
+                    child: SizedBox(
+                      width: constraints.maxWidth,
+                      height: constraints.maxHeight,
+                      child: FittedBox(
                         fit: BoxFit.contain,
-                        filterQuality: FilterQuality.high,
-                        placeholder: const SizedBox(
-                          width: 48,
-                          height: 48,
-                          child: CircularProgressIndicator(
-                            color: Colors.white,
-                            strokeWidth: 2,
+                        child: CachedNetworkImage(
+                          imageUrl: imageUrl,
+                          fit: BoxFit.contain,
+                          filterQuality: FilterQuality.high,
+                          downsample: false,
+                          placeholder: const SizedBox(
+                            width: 48,
+                            height: 48,
+                            child: CircularProgressIndicator(
+                              color: Colors.white,
+                              strokeWidth: 2,
+                            ),
                           ),
-                        ),
-                        errorWidget: const Icon(
-                          CupertinoIcons.exclamationmark_triangle,
-                          color: Colors.white54,
-                          size: 48,
+                          errorWidget: const Icon(
+                            CupertinoIcons.exclamationmark_triangle,
+                            color: Colors.white54,
+                            size: 48,
+                          ),
                         ),
                       ),
                     ),
-                  ),
-                );
-              },
-            ),
+                  );
+                },
+              ),
             ),
             Positioned(
               top: 0,
@@ -81,7 +113,8 @@ class GeneratedImagePreviewScreen extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     IconButton(
-                      icon: const Icon(CupertinoIcons.xmark, color: Colors.white),
+                      icon:
+                          const Icon(CupertinoIcons.xmark, color: Colors.white),
                       onPressed: () => Navigator.of(context).maybePop(),
                       tooltip: 'Close',
                     ),

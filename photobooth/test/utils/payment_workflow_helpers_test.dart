@@ -5,6 +5,7 @@ import 'package:photobooth/screens/theme_selection/theme_model.dart';
 import 'package:photobooth/services/event_manager.dart';
 import 'package:photobooth/services/kiosk_manager.dart';
 import 'package:photobooth/utils/constants.dart';
+import 'package:photobooth/utils/app_strings.dart';
 import 'package:photobooth/utils/payment_workflow_helpers.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -161,6 +162,18 @@ void main() {
         AppConstants.kRouteGenerateProgress,
       );
     });
+
+    test('skips pre-payment when WAN is down', () {
+      expect(
+        resolvePostFrameRoute(
+          paymentsEnabled: true,
+          paymentCollectionTiming:
+              AppConstants.kPaymentCollectionBeforeGeneration,
+          wanDown: true,
+        ),
+        AppConstants.kRouteGenerateProgress,
+      );
+    });
   });
 
   group('resolvePaymentsEnabled', () {
@@ -171,6 +184,122 @@ void main() {
     test('respects kiosk override false', () async {
       await KioskManager().setPaymentEnabledOverride(false);
       expect(await resolvePaymentsEnabled(), isFalse);
+    });
+  });
+
+  group('shouldSkipOfflinePayCollect', () {
+    test('never skips cash collect', () {
+      expect(
+        shouldSkipOfflinePayCollect(
+          paymentsEnabled: false,
+          sessionOffline: true,
+        ),
+        isFalse,
+      );
+      expect(
+        shouldSkipOfflinePayCollect(
+          paymentsEnabled: true,
+          sessionOffline: true,
+        ),
+        isFalse,
+      );
+      expect(
+        shouldSkipOfflinePayCollect(
+          paymentsEnabled: false,
+          sessionOffline: false,
+        ),
+        isFalse,
+      );
+    });
+  });
+
+  group('shouldCollectCounterCash', () {
+    test('true when UPI is off', () {
+      expect(shouldCollectCounterCash(paymentsEnabled: false), isTrue);
+      expect(shouldCollectCounterCash(paymentsEnabled: true), isFalse);
+    });
+  });
+
+  group('pay screen copy', () {
+    test('app bar is cash at the counter when UPI is off and WAN is up', () {
+      expect(
+        payScreenAppBarSubtitle(
+          collectsCounterCash: true,
+          sessionOffline: false,
+        ),
+        AppStrings.counterCashAppBarSubtitle,
+      );
+      expect(
+        payScreenAppBarSubtitle(
+          collectsCounterCash: true,
+          sessionOffline: true,
+        ),
+        AppStrings.wanDownCashAppBarSubtitle,
+      );
+      expect(
+        payScreenAppBarSubtitle(
+          collectsCounterCash: false,
+          sessionOffline: false,
+        ),
+        AppStrings.payScanToComplete,
+      );
+    });
+
+    test('intro is omitted for offline payment', () {
+      expect(
+        payScreenIntroMessage(collectsCounterCash: true),
+        isNull,
+      );
+      expect(
+        payScreenIntroMessage(collectsCounterCash: false),
+        AppStrings.payUpiIntro,
+      );
+    });
+
+    test('status tells staff to confirm in Payments when WAN is up', () {
+      expect(
+        payScreenCashStatus(sessionOffline: false),
+        AppStrings.counterCashOnlyWaiting,
+      );
+      expect(
+        payScreenCashStatus(sessionOffline: true),
+        AppStrings.offlineCashOnlyWaiting,
+      );
+    });
+
+    test('staff PIN confirm is native WAN-down only', () {
+      expect(
+        payScreenShowsStaffPinConfirm(sessionOffline: true, isWeb: false),
+        isTrue,
+      );
+      expect(
+        payScreenShowsStaffPinConfirm(sessionOffline: true, isWeb: true),
+        isFalse,
+      );
+      expect(
+        payScreenShowsStaffPinConfirm(sessionOffline: false, isWeb: false),
+        isFalse,
+      );
+      expect(
+        payScreenShowsStaffPinConfirm(
+          sessionOffline: true,
+          isWeb: false,
+          skipOfflineCashPin: true,
+        ),
+        isFalse,
+      );
+      expect(
+        payScreenShowsStaffPinConfirm(
+          sessionOffline: true,
+          isWeb: false,
+          autoApproveCashPrint: true,
+        ),
+        isFalse,
+      );
+      expect(
+        skipCashStaffApproval(autoApproveCashPrint: true),
+        isTrue,
+      );
     });
   });
 
@@ -206,6 +335,41 @@ void main() {
       await tester.tap(find.text('go'));
       await tester.pumpAndSettle();
       expect(find.text('pre-pay'), findsOneWidget);
+    });
+
+    testWidgets('skips pre-payment when wanDown', (tester) async {
+      await KioskManager().setPaymentEnabledOverride(true);
+      await tester.pumpWidget(
+        MaterialApp(
+          routes: {
+            '/': (_) => Builder(
+                  builder: (context) => ElevatedButton(
+                    onPressed: () {
+                      navigateToGenerationOrPrePayment(
+                        context: context,
+                        photo: _testPhoto(),
+                        theme: _testTheme(),
+                        replace: false,
+                        paymentCollectionTiming:
+                            AppConstants.kPaymentCollectionBeforeGeneration,
+                        wanDown: true,
+                      );
+                    },
+                    child: const Text('go'),
+                  ),
+                ),
+            AppConstants.kRoutePrePayment: (_) =>
+                const Scaffold(body: Text('pre-pay')),
+            AppConstants.kRouteGenerateProgress: (_) =>
+                const Scaffold(body: Text('generate')),
+          },
+        ),
+      );
+
+      await tester.tap(find.text('go'));
+      await tester.pumpAndSettle();
+      expect(find.text('generate'), findsOneWidget);
+      expect(find.text('pre-pay'), findsNothing);
     });
 
     testWidgets('pushReplacement navigates to generate progress', (tester) async {

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
@@ -89,10 +90,9 @@ class _FotoFlashbackFilterScreenState extends State<FotoFlashbackFilterScreen> {
     setState(() => _navigatingBack = true);
     vm?.clearCapturePreview();
     final theme = args?.theme ?? vm!.theme;
-    final mode = args?.resolvedShotMode ??
-        (vm!.isSingleClassic
-            ? ClassicShotMode.single6x4
-            : ClassicShotMode.fourShot);
+    // Back → POSE must reopen the same strip length the guest just shot.
+    final mode =
+        args?.resolvedShotMode ?? classicStripShotModeForCount(vm!.shotCount);
     try {
       await navigateBackToClassicCaptureFromLooks(
         context: context,
@@ -222,46 +222,13 @@ class _FotoFlashbackFilterScreenState extends State<FotoFlashbackFilterScreen> {
                           ),
                         ),
                       ],
-                      if (!_busy && viewModel.isPreparingPreview) ...[
-                        const SizedBox(height: 8),
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            SizedBox(
-                              width: 14,
-                              height: 14,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: Colors.amber.shade300,
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            Text(
-                              AppStrings.flashbackPreparingPreview,
-                              style: TextStyle(
-                                color: Colors.amber.shade100
-                                    .withValues(alpha: 0.85),
-                                fontSize: 12,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ] else if (!_busy &&
-                          viewModel.isSingleClassic &&
-                          viewModel.isWarmingPrintPreview &&
-                          viewModel.lookComposePreviewUrl == null) ...[
-                        const SizedBox(height: 8),
-                        Text(
-                          AppStrings.flashbackWarmingPrintPreview,
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                            color: Colors.amber.shade100.withValues(alpha: 0.55),
-                            fontSize: 11,
-                            fontWeight: FontWeight.w500,
-                          ),
-                        ),
-                      ],
+                      _LookPickerStatusSlot(
+                        showPreparing: !_busy && viewModel.isPreparingPreview,
+                        showWarmingPrintMatch: !_busy &&
+                            viewModel.isSingleClassic &&
+                            viewModel.isWarmingPrintPreview &&
+                            viewModel.lookComposePreviewUrl == null,
+                      ),
                       if (!_busy &&
                           viewModel.classicOverlayCleanupEnabled &&
                           viewModel.scrubDotStatuses.isNotEmpty) ...[
@@ -338,7 +305,8 @@ class _FotoFlashbackFilterScreenState extends State<FotoFlashbackFilterScreen> {
                       ],
                       const SizedBox(height: 12),
                       Expanded(
-                        child: viewModel.isHydratingCaptures
+                        child: viewModel.isHydratingCaptures &&
+                                !viewModel.hasLookPreviewJpegBytes
                             ? Center(
                                 child: Column(
                                   mainAxisSize: MainAxisSize.min,
@@ -366,14 +334,31 @@ class _FotoFlashbackFilterScreenState extends State<FotoFlashbackFilterScreen> {
                           ),
                           child: _LookPickerBody(
                           imageDataUrls: viewModel.previewImageDataUrls,
+                          imageJpegBytes: viewModel.lookPreviewJpegBytes,
                           imagesAreGraded: viewModel.previewImagesAreGraded,
-                          serverComposePreviewUrl:
-                              viewModel.lookComposePreviewUrl,
-                          isRefreshingComposePreview: false,
                           layout: viewModel.wysiwygLayout,
                           filterId: viewModel.selectedFilterId,
                           frameId: viewModel.selectedFrameId,
-                          frameOverlayUrl: viewModel.selectedFrame?.overlayUrl,
+                          frameOverlayUrl: classicOccasionOverlayUrl(
+                            overlayUrl: viewModel.selectedFrame?.overlayUrl,
+                            landscapeOverlayUrl:
+                                viewModel.selectedFrame?.landscapeOverlayUrl,
+                            landscape: viewModel.printOrientation ==
+                                PrintOrientation.landscape,
+                          ),
+                          frameSlots: classicOccasionOverlaySlots(
+                            slots: viewModel.selectedFrame?.slots ?? const [],
+                            landscapeSlots:
+                                viewModel.selectedFrame?.landscapeSlots ??
+                                    const [],
+                            landscape: viewModel.printOrientation ==
+                                PrintOrientation.landscape,
+                            hasLandscapeOverlay:
+                                (viewModel.selectedFrame?.landscapeOverlayUrl ??
+                                        '')
+                                    .trim()
+                                    .isNotEmpty,
+                          ),
                           frameCaption: viewModel.selectedFrame?.caption,
                           stickerId: viewModel.selectedStickerId,
                           placements: viewModel.stickerPlacements,
@@ -456,17 +441,83 @@ class _FotoFlashbackFilterScreenState extends State<FotoFlashbackFilterScreen> {
   }
 }
 
+/// Always occupies one status line so "Preparing print match…" (and polish)
+/// can appear without shifting chips / strip below.
+class _LookPickerStatusSlot extends StatelessWidget {
+  const _LookPickerStatusSlot({
+    required this.showPreparing,
+    required this.showWarmingPrintMatch,
+  });
+
+  final bool showPreparing;
+  final bool showWarmingPrintMatch;
+
+  /// Gap + 11pt warming line (taller polish row still fits).
+  static const double _height = 32;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: _height,
+      width: double.infinity,
+      child: Align(
+        alignment: Alignment.center,
+        child: _statusChild(),
+      ),
+    );
+  }
+
+  Widget _statusChild() {
+    if (showPreparing) {
+      return Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          SizedBox(
+            width: 14,
+            height: 14,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: Colors.amber.shade300,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            AppStrings.flashbackPreparingPreview,
+            style: TextStyle(
+              color: Colors.amber.shade100.withValues(alpha: 0.85),
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+      );
+    }
+    if (showWarmingPrintMatch) {
+      return Text(
+        AppStrings.flashbackWarmingPrintPreview,
+        textAlign: TextAlign.center,
+        style: TextStyle(
+          color: Colors.amber.shade100.withValues(alpha: 0.55),
+          fontSize: 11,
+          fontWeight: FontWeight.w500,
+        ),
+      );
+    }
+    return const SizedBox.shrink();
+  }
+}
+
 /// Strip (left) + looks (right), top-aligned and height-matched.
 class _LookPickerBody extends StatelessWidget {
   const _LookPickerBody({
     required this.imageDataUrls,
+    this.imageJpegBytes = const [],
     required this.imagesAreGraded,
-    this.serverComposePreviewUrl,
-    this.isRefreshingComposePreview = false,
     required this.layout,
     required this.filterId,
     required this.frameId,
     this.frameOverlayUrl,
+    this.frameSlots = const [],
     this.frameCaption,
     required this.stickerId,
     required this.placements,
@@ -484,13 +535,13 @@ class _LookPickerBody extends StatelessWidget {
   });
 
   final List<String> imageDataUrls;
+  final List<Uint8List> imageJpegBytes;
   final bool imagesAreGraded;
-  final String? serverComposePreviewUrl;
-  final bool isRefreshingComposePreview;
   final StripWysiwygLayout layout;
   final String filterId;
   final String frameId;
   final String? frameOverlayUrl;
+  final List<StripTemplateSlot> frameSlots;
   final String? frameCaption;
   final String stickerId;
   final List<StripStickerPlacement> placements;
@@ -514,7 +565,9 @@ class _LookPickerBody extends StatelessWidget {
         if (panelH <= 0) return const SizedBox.shrink();
 
         // Dual-strip chrome → tall 2×6; sheet → portrait 4×6; 1-shot → L/P.
-        final single = imageDataUrls.length == 1;
+        final shotCount =
+            imageJpegBytes.isNotEmpty ? imageJpegBytes.length : imageDataUrls.length;
+        final single = shotCount == 1;
         final sheet = !single && isStripSheetLayout(frameId);
         final aspect = single
             ? (printOrientation == PrintOrientation.portrait
@@ -538,13 +591,15 @@ class _LookPickerBody extends StatelessWidget {
             children: [
               FotoFlashbackStripPreview(
                 imageDataUrls: imageDataUrls,
+                imageJpegBytes: imageJpegBytes,
                 imagesAreGraded: imagesAreGraded,
-                serverComposePreviewUrl: serverComposePreviewUrl,
-                isRefreshingComposePreview: isRefreshingComposePreview,
                 layout: layout,
                 filterId: filterId,
                 frameId: frameId,
                 frameOverlayUrl: frameOverlayUrl,
+                overlayCacheLandscape:
+                    printOrientation == PrintOrientation.landscape,
+                frameSlots: frameSlots,
                 frameCaption: frameCaption,
                 stickerId: stickerId,
                 placements: placements,

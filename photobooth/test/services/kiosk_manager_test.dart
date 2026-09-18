@@ -9,9 +9,12 @@ void main() {
     SharedPreferences.setMockInitialValues({});
     await KioskManager().clearPaymentEnabledOverride();
     await KioskManager().clearClassicPhotosEnabled();
+    await KioskManager().clearAiPhotosEnabled();
+    await KioskManager().clearOperatingModeOffline();
     await KioskManager().clearKioskCode();
     KioskManager.resetPaymentOverrideCacheForTests();
     KioskManager.resetClassicPhotosCacheForTests();
+    KioskManager.resetOperatingModeCacheForTests();
   });
 
   test('payment override and clear flows', () async {
@@ -49,5 +52,67 @@ void main() {
     await km.clearClassicPhotosEnabled();
     KioskManager.resetClassicPhotosCacheForTests();
     expect(await km.isClassicPhotosEnabled(), isTrue);
+  });
+
+  test('AI photos defaults true and persists', () async {
+    final km = KioskManager();
+    expect(await km.isAiPhotosEnabled(), isTrue);
+    await km.setAiPhotosEnabled(false);
+    expect(await km.isAiPhotosEnabled(), isFalse);
+    KioskManager.resetClassicPhotosCacheForTests();
+    expect(await km.isAiPhotosEnabled(), isFalse);
+    await km.clearAiPhotosEnabled();
+    KioskManager.resetClassicPhotosCacheForTests();
+    expect(await km.isAiPhotosEnabled(), isTrue);
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('kiosk_ai_photos_enabled', false);
+    KioskManager.resetClassicPhotosCacheForTests();
+    expect(await km.isAiPhotosEnabled(), isFalse);
+  });
+
+  test('operating mode defaults online and persists offline', () async {
+    final km = KioskManager();
+    expect(await km.isOperatingModeOffline(), isFalse);
+    expect(KioskManager.isOperatingModeOfflineCached, isFalse);
+    await km.setOperatingModeOffline(true);
+    expect(await km.isOperatingModeOffline(), isTrue);
+    expect(KioskManager.isOperatingModeOfflineCached, isTrue);
+    KioskManager.resetOperatingModeCacheForTests();
+    expect(await km.isOperatingModeOffline(), isTrue);
+    await km.clearOperatingModeOffline();
+    KioskManager.resetOperatingModeCacheForTests();
+    expect(await km.isOperatingModeOffline(), isFalse);
+  });
+
+  test('isOperatingModeOffline reads prefs when cache empty', () async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('kiosk_operating_mode_offline', true);
+    KioskManager.resetOperatingModeCacheForTests();
+    expect(await KioskManager().isOperatingModeOffline(), isTrue);
+  });
+
+  test('classic shot modes cache, prefs, and invalid values', () async {
+    final km = KioskManager();
+    expect(await km.getClassicShotModes(), [1, 3, 4]);
+    expect(await km.getClassicShotModes(), [1, 3, 4]);
+    await km.setClassicShotModes([4, 1, 9]);
+    expect(await km.getClassicShotModes(), [1, 4]);
+    KioskManager.resetClassicPhotosCacheForTests();
+    expect(await km.getClassicShotModes(), [1, 4]);
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('kiosk_classic_shot_modes', ['9', 'x']);
+    KioskManager.resetClassicPhotosCacheForTests();
+    expect(await km.getClassicShotModes(), [1, 3, 4]);
+
+    await prefs.setStringList('kiosk_classic_shot_modes', ['3']);
+    KioskManager.resetClassicPhotosCacheForTests();
+    expect(await km.getClassicShotModes(), [3]);
+
+    await km.setClassicShotModes(const []);
+    expect(await km.getClassicShotModes(), [1, 3, 4]);
+    await km.setClassicShotModes(const [2, 9]);
+    expect(await km.getClassicShotModes(), [1, 3, 4]);
   });
 }

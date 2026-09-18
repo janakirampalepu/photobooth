@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 
 import '../../services/app_settings_manager.dart';
 import '../../services/payment_push_coordinator.dart';
+import '../../services/session_manager.dart';
 import '../../utils/app_strings.dart';
 import '../../utils/constants.dart';
 import '../../utils/fotoflashback_payment_helpers.dart';
@@ -13,7 +14,6 @@ import '../../utils/route_args.dart';
 import '../../views/widgets/app_snackbar.dart';
 import '../../views/widgets/centered_max_width.dart';
 import '../../views/widgets/kiosk_payment_qr_display.dart';
-import '../../views/widgets/leading_with_alice.dart';
 import '../../views/widgets/theme_background.dart';
 import '../result/result_payment_coupon_row.dart';
 import '../theme_selection/theme_model.dart';
@@ -57,6 +57,10 @@ class _PrePaymentScreenState extends State<PrePaymentScreen> {
   }
 
   Future<void> _bootstrapPayment() async {
+    if (SessionManager().isOfflineSession) {
+      _onPaymentApproved();
+      return;
+    }
     final paymentsEnabled = await resolvePaymentsEnabled();
     if (!mounted) return;
     if (!paymentsEnabled) {
@@ -175,7 +179,6 @@ class _PrePaymentScreenState extends State<PrePaymentScreen> {
             icon: const Icon(Icons.arrow_back, color: Colors.white),
             onPressed: () => Navigator.of(context).maybePop(),
           ),
-          actions: const [AppBarAliceAction()],
         ),
         body: Stack(
           children: [
@@ -264,13 +267,23 @@ class _PrePaymentCard extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 8),
-          ResultPaymentCouponRow(
-            appliedDiscount: viewModel.appliedDiscount,
-            couponError: viewModel.couponError,
-            busy: viewModel.couponBusy || viewModel.paymentInitInProgress,
-            onApply: viewModel.applyCoupon,
-            onUnapply: viewModel.unapplyCoupon,
-          ),
+          if (!SessionManager().isOfflineSession)
+            ResultPaymentCouponRow(
+              appliedDiscount: viewModel.appliedDiscount,
+              couponError: viewModel.couponError,
+              busy: viewModel.couponBusy || viewModel.paymentInitInProgress,
+              onApply: viewModel.applyCoupon,
+              onUnapply: viewModel.unapplyCoupon,
+            )
+          else
+            const Padding(
+              padding: EdgeInsets.only(bottom: 8),
+              child: Text(
+                AppStrings.offlineGiftCardUnavailable,
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.white70, fontSize: 13),
+              ),
+            ),
           const SizedBox(height: 6),
           Expanded(
             child: Center(
